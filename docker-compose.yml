@@ -1,0 +1,19 @@
+services:
+  restdl:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /app/database
+      DATABASE_URL: sqlite:////app/database/downloads.db
+    volumes:
+      - restdl_data:/app/database
+      - restdl_downloads:/app/downloads
+      - restdl_logs:/app/logs
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  restdl_data:
+  restdl_downloads:
+  restdl_logs:

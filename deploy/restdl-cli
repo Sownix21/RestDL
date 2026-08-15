@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SERVICE="restdl.service"
+ENV_FILE="/etc/restdl/restdl.env"
+APP_DIR="/opt/restdl"
+DATA_DIR="/var/lib/restdl"
+
+need_root() {
+  if [[ ${EUID} -ne 0 ]]; then exec sudo -- "$0" "$@"; fi
+}
+
+set_env() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  if [[ -f "$ENV_FILE" ]]; then grep -v "^${key}=" "$ENV_FILE" > "$tmp" || true; fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  install -m 600 -o root -g restdl "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+configure() {
+  local api_id api_hash token admin db key
+  read -rp "Bot API ID: " api_id </dev/tty
+  read -rsp "Bot API hash: " api_hash </dev/tty; echo
+  read -rsp "Bot token: " token </dev/tty; echo
+  read -rp "Main admin Telegram numeric user ID: " admin </dev/tty
+  read -rp "Database URL [sqlite:////var/lib/restdl/downloads.db]: " db </dev/tty
+  [[ "$api_id" =~ ^[0-9]+$ ]] || { echo "API ID must be numeric."; return 1; }
+  [[ ${#api_hash} -ge 16 ]] || { echo "API hash is too short."; return 1; }
+  [[ "$token" == *:* ]] || { echo "Bot token is malformed."; return 1; }
+  [[ "$admin" =~ ^[0-9]+$ ]] || { echo "Admin ID must be numeric."; return 1; }
+  db="${db:-sqlite:////var/lib/restdl/downloads.db}"
+  key="$(grep '^SESSION_ENCRYPTION_KEY=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  if [[ -z "$key" ]]; then
+    key="$($APP_DIR/.venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+  fi
+  install -d -m 750 -o root -g restdl /etc/restdl
+  touch "$ENV_FILE"; chmod 600 "$ENV_FILE"; chown root:restdl "$ENV_FILE"
+  set_env API_ID "$api_id"; set_env API_HASH "$api_hash"; set_env BOT_TOKEN "$token"
+  set_env ADMIN_USER_ID "$admin"; set_env DATABASE_URL "$db"
+  set_env DATA_DIR /var/lib/restdl
+  set_env SESSION_ENCRYPTION_KEY "$key"; set_env ENVIRONMENT production
+  set_env MAX_CONCURRENT_DOWNLOADS 4; set_env LOG_LEVEL INFO
+  echo "Configuration saved. The encryption key is in $ENV_FILE; back it up securely."
+}
+
+backup() {
+  install -d -m 750 "$DATA_DIR/backups"
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  if [[ ! -f "$DATA_DIR/downloads.db" ]]; then
+    echo "SQLite database not found. For PostgreSQL, use pg_dump with the configured DATABASE_URL."
+    return 1
+  fi
+  systemctl stop "$SERVICE"
+  if ! cp -a "$DATA_DIR/downloads.db" "$DATA_DIR/backups/downloads-$stamp.db"; then
+    systemctl start "$SERVICE"
+    return 1
+  fi
+  systemctl start "$SERVICE"
+  echo "Backup: $DATA_DIR/backups/downloads-$stamp.db"
+}
+
+uninstall_all() {
+  read -rp "Type DELETE RESTDL to remove the service, application, configuration and data: " answer </dev/tty
+  [[ "$answer" == "DELETE RESTDL" ]] || { echo "Cancelled."; return; }
+  systemctl disable --now "$SERVICE" 2>/dev/null || true
+  rm -f /etc/systemd/system/restdl.service /usr/local/bin/restdl
+  systemctl daemon-reload
+  rm -rf -- "$APP_DIR" /etc/restdl "$DATA_DIR" /var/log/restdl
+  userdel restdl 2>/dev/null || true
+  echo "RestrictiveDL was fully removed. This cannot be undone."
+}
+
+menu() {
+  while true; do
+    cat <<'EOF'
+
+RestrictiveDL management
+1) Status          2) Start           3) Stop
+4) Restart         5) Live logs       6) Recent logs
+7) Configure       8) Change admin    9) Change bot token
+10) Backup DB      11) Update app     12) Generate user session
+13) Full uninstall 0) Exit
+EOF
+    read -rp "> " choice </dev/tty
+    case "$choice" in
+      1) systemctl --no-pager status "$SERVICE" || true ;;
+      2) systemctl start "$SERVICE" ;;
+      3) systemctl stop "$SERVICE" ;;
+      4) systemctl restart "$SERVICE" ;;
+      5) journalctl -fu "$SERVICE" ;;
+      6) journalctl -u "$SERVICE" -n 200 --no-pager ;;
+      7) configure; systemctl restart "$SERVICE" ;;
+      8) read -rp "New admin Telegram user ID: " v </dev/tty; [[ "$v" =~ ^[0-9]+$ ]] && set_env ADMIN_USER_ID "$v" && systemctl restart "$SERVICE" || echo "Admin ID must be numeric." ;;
+      9) read -rsp "New bot token: " v </dev/tty; echo; [[ "$v" == *:* ]] && set_env BOT_TOKEN "$v" && systemctl restart "$SERVICE" || echo "Bot token is malformed." ;;
+      10) backup ;;
+      11) git -C "$APP_DIR" pull --ff-only; "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"; systemctl restart "$SERVICE" ;;
+      12) sudo -u restdl "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/generate_session.py" ;;
+      13) uninstall_all; exit ;;
+      0) exit ;;
+      *) echo "Invalid selection." ;;
+    esac
+  done
+}
+
+need_root "$@"
+case "${1:-menu}" in
+  start|stop|restart|status) systemctl "$1" "$SERVICE" ;;
+  logs) journalctl -fu "$SERVICE" ;;
+  configure) configure ;;
+  uninstall) uninstall_all ;;
+  menu) menu ;;
+  *) echo "Usage: restdl [menu|start|stop|restart|status|logs|configure|uninstall]"; exit 2 ;;
+esac
