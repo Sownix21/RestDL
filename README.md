@@ -7,7 +7,7 @@ A multi-user Telegram media downloader with isolated user sessions, English/Pers
 - The single administrator is configured only on the Linux server with `ADMIN_USER_ID`; users cannot promote themselves in Telegram.
 - Each user supplies their own Telegram API credentials and Pyrogram session. Credentials and sessions are encrypted at rest with Fernet.
 - Each user has an isolated client, task set, resume state, history, and forward destination.
-- User downloads go to that user's configured destination (or their private bot chat). A separate attributed copy goes to the administrator.
+- User downloads go to that user's configured destination (or their private bot chat). 
 - Login codes must **never** be pasted into a Telegram chat. Telegram officially invalidates login codes sent to another chat. Generate a session locally with `scripts/generate_session.py`; the terminal flow supports Telegram-delivered codes and two-step-verification passwords.
 - Treat a Pyrogram session string like a password. Disconnecting through the bot erases its encrypted server copy.
 
