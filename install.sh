@@ -19,7 +19,7 @@ install -d -m 750 -o restdl -g restdl /var/lib/restdl "$APP_DIR/downloads" "$APP
 tar -C "$SOURCE_DIR" \
   --exclude='./.env' --exclude='./.venv' --exclude='./__pycache__' \
   --exclude='./database' --exclude='./downloads' --exclude='./logs' \
-  -cf - . | tar -C "$APP_DIR" -xf -
+  -cf - . | tar --no-overwrite-dir -C "$APP_DIR" -xf -
 python3 -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip wheel
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
@@ -27,7 +27,10 @@ install -m 644 "$APP_DIR/deploy/restdl.service" /etc/systemd/system/restdl.servi
 install -m 755 "$APP_DIR/deploy/restdl-cli" /usr/local/bin/restdl
 chown -R root:restdl "$APP_DIR"
 chmod -R go-w "$APP_DIR"
+chmod 755 "$APP_DIR"
+chmod -R g+rX "$APP_DIR"
 chown -R restdl:restdl "$APP_DIR/downloads" "$APP_DIR/logs" /var/lib/restdl /var/log/restdl
+chmod 750 "$APP_DIR/downloads" "$APP_DIR/logs" /var/lib/restdl /var/log/restdl
 systemctl daemon-reload
 systemctl enable restdl.service
 echo "Installation complete. Starting interactive configuration..."

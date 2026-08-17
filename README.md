@@ -37,6 +37,21 @@ restdl
 
 The management menu provides service status/start/stop/restart, configuration, administrator/token changes, recent/live logs, database backup, update, local session generation, and confirmed full uninstall. The configuration is stored at `/etc/restdl/restdl.env` with mode `0600`.
 
+### Repairing a `status=200/CHDIR` service error
+
+If a version installed before the permission fix cannot enter `/opt/restdl`, run:
+
+```bash
+sudo systemctl stop restdl
+sudo chown root:restdl /opt/restdl
+sudo chmod 755 /opt/restdl
+sudo chmod -R g+rX /opt/restdl
+sudo systemctl restart restdl
+sudo systemctl status restdl --no-pager
+```
+
+Current installations also provide `sudo restdl repair` and a **Repair permissions** management-menu action.
+
 ## Manual development setup
 
 ```bash

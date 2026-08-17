@@ -61,6 +61,27 @@ backup() {
   echo "Backup: $DATA_DIR/backups/downloads-$stamp.db"
 }
 
+repair_permissions() {
+  [[ -d "$APP_DIR" ]] || { echo "$APP_DIR does not exist."; return 1; }
+  chown -R root:restdl "$APP_DIR"
+  chmod -R go-w "$APP_DIR"
+  chmod 755 "$APP_DIR"
+  chmod -R g+rX "$APP_DIR"
+  install -d -m 750 -o restdl -g restdl \
+    "$APP_DIR/downloads" "$APP_DIR/logs" "$DATA_DIR" /var/log/restdl
+  chown -R restdl:restdl \
+    "$APP_DIR/downloads" "$APP_DIR/logs" "$DATA_DIR" /var/log/restdl
+  if [[ -d /etc/restdl ]]; then
+    chown root:restdl /etc/restdl
+    chmod 750 /etc/restdl
+  fi
+  if [[ -f "$ENV_FILE" ]]; then
+    chown root:restdl "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
+  echo "RestrictiveDL ownership and traversal permissions repaired."
+}
+
 uninstall_all() {
   read -rp "Type DELETE RESTDL to remove the service, application, configuration and data: " answer </dev/tty
   [[ "$answer" == "DELETE RESTDL" ]] || { echo "Cancelled."; return; }
@@ -81,7 +102,8 @@ RestrictiveDL management
 4) Restart         5) Live logs       6) Recent logs
 7) Configure       8) Change admin    9) Change bot token
 10) Backup DB      11) Update app     12) Generate user session
-13) Full uninstall 0) Exit
+13) Repair permissions              14) Full uninstall
+0) Exit
 EOF
     read -rp "> " choice </dev/tty
     case "$choice" in
@@ -95,9 +117,10 @@ EOF
       8) read -rp "New admin Telegram user ID: " v </dev/tty; [[ "$v" =~ ^[0-9]+$ ]] && set_env ADMIN_USER_ID "$v" && systemctl restart "$SERVICE" || echo "Admin ID must be numeric." ;;
       9) read -rsp "New bot token: " v </dev/tty; echo; [[ "$v" == *:* ]] && set_env BOT_TOKEN "$v" && systemctl restart "$SERVICE" || echo "Bot token is malformed." ;;
       10) backup ;;
-      11) git -C "$APP_DIR" pull --ff-only; "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"; systemctl restart "$SERVICE" ;;
+      11) git -C "$APP_DIR" pull --ff-only; "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"; repair_permissions; systemctl restart "$SERVICE" ;;
       12) sudo -u restdl "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/generate_session.py" ;;
-      13) uninstall_all; exit ;;
+      13) repair_permissions; systemctl restart "$SERVICE" ;;
+      14) uninstall_all; exit ;;
       0) exit ;;
       *) echo "Invalid selection." ;;
     esac
@@ -109,7 +132,8 @@ case "${1:-menu}" in
   start|stop|restart|status) systemctl "$1" "$SERVICE" ;;
   logs) journalctl -fu "$SERVICE" ;;
   configure) configure ;;
+  repair) repair_permissions ;;
   uninstall) uninstall_all ;;
   menu) menu ;;
-  *) echo "Usage: restdl [menu|start|stop|restart|status|logs|configure|uninstall]"; exit 2 ;;
+  *) echo "Usage: restdl [menu|start|stop|restart|status|logs|configure|repair|uninstall]"; exit 2 ;;
 esac
