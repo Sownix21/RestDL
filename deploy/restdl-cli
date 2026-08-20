@@ -20,11 +20,13 @@ set_env() {
 }
 
 configure() {
-  local api_id api_hash token admin db key
+  local api_id api_hash token admin db key admin_session existing_session
   read -rp "Bot API ID: " api_id </dev/tty
   read -rsp "Bot API hash: " api_hash </dev/tty; echo
   read -rsp "Bot token: " token </dev/tty; echo
   read -rp "Main admin Telegram numeric user ID: " admin </dev/tty
+  existing_session="$(grep '^SESSION_STRING=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  read -rsp "Optional admin Pyrogram session string [Enter to keep current/use in-bot login]: " admin_session </dev/tty; echo
   read -rp "Database URL [sqlite:////var/lib/restdl/downloads.db]: " db </dev/tty
   [[ "$api_id" =~ ^[0-9]+$ ]] || { echo "API ID must be numeric."; return 1; }
   [[ ${#api_hash} -ge 16 ]] || { echo "API hash is too short."; return 1; }
@@ -39,6 +41,11 @@ configure() {
   touch "$ENV_FILE"; chmod 600 "$ENV_FILE"; chown root:restdl "$ENV_FILE"
   set_env API_ID "$api_id"; set_env API_HASH "$api_hash"; set_env BOT_TOKEN "$token"
   set_env ADMIN_USER_ID "$admin"; set_env DATABASE_URL "$db"
+  if [[ -n "$admin_session" ]]; then
+    set_env SESSION_STRING "$admin_session"
+  elif [[ -n "$existing_session" ]]; then
+    set_env SESSION_STRING "$existing_session"
+  fi
   set_env DATA_DIR /var/lib/restdl
   set_env SESSION_ENCRYPTION_KEY "$key"; set_env ENVIRONMENT production
   set_env MAX_CONCURRENT_DOWNLOADS 4; set_env LOG_LEVEL INFO
@@ -82,6 +89,18 @@ repair_permissions() {
   echo "RestrictiveDL ownership and traversal permissions repaired."
 }
 
+update_app() {
+  systemctl stop "$SERVICE"
+  git -C "$APP_DIR" pull --ff-only
+  "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
+  install -m 644 "$APP_DIR/deploy/restdl.service" /etc/systemd/system/restdl.service
+  install -m 755 "$APP_DIR/deploy/restdl-cli" /usr/local/bin/restdl
+  repair_permissions
+  systemctl daemon-reload
+  systemctl restart "$SERVICE"
+  echo "RestrictiveDL updated and restarted."
+}
+
 uninstall_all() {
   read -rp "Type DELETE RESTDL to remove the service, application, configuration and data: " answer </dev/tty
   [[ "$answer" == "DELETE RESTDL" ]] || { echo "Cancelled."; return; }
@@ -117,7 +136,7 @@ EOF
       8) read -rp "New admin Telegram user ID: " v </dev/tty; [[ "$v" =~ ^[0-9]+$ ]] && set_env ADMIN_USER_ID "$v" && systemctl restart "$SERVICE" || echo "Admin ID must be numeric." ;;
       9) read -rsp "New bot token: " v </dev/tty; echo; [[ "$v" == *:* ]] && set_env BOT_TOKEN "$v" && systemctl restart "$SERVICE" || echo "Bot token is malformed." ;;
       10) backup ;;
-      11) git -C "$APP_DIR" pull --ff-only; "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"; repair_permissions; systemctl restart "$SERVICE" ;;
+      11) update_app ;;
       12) sudo -u restdl "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/generate_session.py" ;;
       13) repair_permissions; systemctl restart "$SERVICE" ;;
       14) uninstall_all; exit ;;
@@ -132,8 +151,9 @@ case "${1:-menu}" in
   start|stop|restart|status) systemctl "$1" "$SERVICE" ;;
   logs) journalctl -fu "$SERVICE" ;;
   configure) configure ;;
+  update) update_app ;;
   repair) repair_permissions ;;
   uninstall) uninstall_all ;;
   menu) menu ;;
-  *) echo "Usage: restdl [menu|start|stop|restart|status|logs|configure|repair|uninstall]"; exit 2 ;;
+  *) echo "Usage: restdl [menu|start|stop|restart|status|logs|configure|update|repair|uninstall]"; exit 2 ;;
 esac

@@ -29,7 +29,7 @@ def check_single_instance():
                 with open(PID_FILE, "r", encoding="utf-8") as existing:
                     old_pid = int(existing.read().strip())
                 if old_pid != os.getpid() and psutil.pid_exists(old_pid):
-                    print(f"❌ Another instance is already running (PID {old_pid}).")
+                    print(f"Another instance is already running (PID {old_pid}).")
                     sys.exit(1)
             except (OSError, TypeError, ValueError):
                 pass
@@ -42,13 +42,13 @@ def check_single_instance():
         pid_file = os.fdopen(descriptor, "w", encoding="utf-8")
         pid_file.write(str(os.getpid()))
         pid_file.flush()
-        print(f"✅ Bot started with PID: {os.getpid()}")
+        print(f"Bot started with PID: {os.getpid()}")
         return pid_file
     except FileExistsError:
-        print("❌ Another bot instance started at the same time.")
+        print("Another bot instance started at the same time.")
         sys.exit(1)
     except Exception as e:
-        print(f"⚠️ Could not create PID file: {e}")
+        print(f"Could not create PID file: {e}")
         return None
 
 # ============ SETUP LOGGING ============
@@ -116,7 +116,7 @@ from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, PeerIdInvalid, BadRequest
 from pyrogram.errors import SessionPasswordNeeded
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BotCommand
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BotCommand, LoginToken
 
 from config import Config
 from logger import get_logger
@@ -234,6 +234,11 @@ async def get_user_downloader(user_id):
     return instance
 
 
+async def connected_account(user_id):
+    """Return the user's client, including the Linux-managed admin account."""
+    return await session_manager.get(user_id)
+
+
 def _state_payload(data):
     return secret_box.encrypt(json.dumps(data)) if data else None
 
@@ -348,6 +353,7 @@ async def initialize_clients():
             await user.start()
             user_me = await user.get_me()
             logger.info(f"👤 Legacy server account started: @{user_me.username} (ID: {user_me.id})")
+            await session_manager.attach_external(Config.ADMIN_USER_ID, user)
 
         await bot.start()
         bot_me = await bot.get_me()
@@ -358,11 +364,21 @@ async def initialize_clients():
             BotCommand("start", "Start or choose language"),
             BotCommand("menu", "Open the interactive menu"),
             BotCommand("help", "Open the step-by-step guide"),
+            BotCommand("dl", "Open download tools"),
+            BotCommand("list", "Browse accessible chats"),
+            BotCommand("settings", "Forwarding and language"),
+            BotCommand("stats", "Download statistics and recovery"),
+            BotCommand("whoami", "Connected Telegram account"),
         ])
         await bot.set_bot_commands([
             BotCommand("start", "شروع یا انتخاب زبان"),
             BotCommand("menu", "باز کردن منوی تعاملی"),
             BotCommand("help", "نمایش راهنمای گام‌به‌گام"),
+            BotCommand("dl", "باز کردن ابزار دانلود"),
+            BotCommand("list", "مرور گفتگوهای قابل دسترس"),
+            BotCommand("settings", "مقصد ارسال و زبان"),
+            BotCommand("stats", "آمار دانلود و بازیابی"),
+            BotCommand("whoami", "حساب تلگرام متصل"),
         ], language_code="fa")
         
         return True
@@ -377,31 +393,36 @@ async def initialize_clients():
 
 # ============ COMMAND HANDLERS ============
 
-def main_keyboard(language):
-    return InlineKeyboardMarkup([
+def main_keyboard(language, admin=False):
+    rows = [
         [InlineKeyboardButton(tr(language, "btn_download"), callback_data="ui:download"),
          InlineKeyboardButton(tr(language, "btn_account"), callback_data="ui:account")],
+        [InlineKeyboardButton(tr(language, "btn_browse"), callback_data="ui:browse")],
         [InlineKeyboardButton(tr(language, "btn_settings"), callback_data="ui:settings"),
          InlineKeyboardButton(tr(language, "btn_tools"), callback_data="ui:tools")],
         [InlineKeyboardButton(tr(language, "btn_help"), callback_data="ui:help")],
-    ])
+    ]
+    if admin:
+        rows.insert(-1, [InlineKeyboardButton(tr(language, "btn_admin"), callback_data="ui:admin")])
+    return InlineKeyboardMarkup(rows)
 
 
 def download_keyboard(language):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(tr(language, "btn_single"), callback_data="ui:single")],
+        [InlineKeyboardButton(tr(language, "btn_single"), callback_data="ui:single"),
+         InlineKeyboardButton(tr(language, "btn_story"), callback_data="ui:story")],
         [InlineKeyboardButton(tr(language, "btn_bulk"), callback_data="ui:bulk"),
          InlineKeyboardButton(tr(language, "btn_batch"), callback_data="ui:range")],
         [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
     ])
 
 
-def account_keyboard(language, connected=False):
+def account_keyboard(language, connected=False, server_managed=False):
     rows = [
         [InlineKeyboardButton(tr(language, "btn_status"), callback_data="ui:account_status")],
         [InlineKeyboardButton(tr(language, "btn_connect"), callback_data="ui:connect")],
     ]
-    if connected:
+    if connected and not server_managed:
         rows.append([InlineKeyboardButton(tr(language, "btn_disconnect"), callback_data="ui:disconnect")])
     rows.append([InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")])
     return InlineKeyboardMarkup(rows)
@@ -412,8 +433,53 @@ def tools_keyboard(language):
         [InlineKeyboardButton(tr(language, "btn_clear_state"), callback_data="ui:clear_state")],
         [InlineKeyboardButton(tr(language, "btn_cancel"), callback_data="ui:cancel_jobs")],
         [InlineKeyboardButton(tr(language, "btn_stats"), callback_data="ui:stats")],
+        [InlineKeyboardButton(tr(language, "btn_getid"), callback_data="ui:getid")],
         [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
     ])
+
+
+def browse_keyboard(language):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(tr(language, "btn_recent"), callback_data="ui:browse_recent"),
+         InlineKeyboardButton(tr(language, "btn_latest"), callback_data="ui:browse_latest")],
+        [InlineKeyboardButton(tr(language, "btn_membership"), callback_data="ui:browse_membership")],
+        [InlineKeyboardButton(tr(language, "btn_test_url"), callback_data="ui:test_url")],
+        [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
+    ])
+
+
+def settings_keyboard(language):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(tr(language, "btn_forward"), callback_data="ui:set_forward")],
+        [InlineKeyboardButton(tr(language, "btn_show_forward"), callback_data="ui:show_forward"),
+         InlineKeyboardButton(tr(language, "btn_test_forward"), callback_data="ui:test_forward")],
+        [InlineKeyboardButton(tr(language, "btn_clear_forward"), callback_data="ui:clear_forward")],
+        [InlineKeyboardButton(tr(language, "btn_language"), callback_data="ui:language")],
+        [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
+    ])
+
+
+def admin_keyboard(language):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(tr(language, "btn_botstats"), callback_data="ui:admin_stats")],
+        [InlineKeyboardButton(tr(language, "btn_logs"), callback_data="ui:admin_logs"),
+         InlineKeyboardButton(tr(language, "btn_cleanup"), callback_data="ui:admin_cleanup")],
+        [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
+    ])
+
+
+def code_keyboard(language):
+    rows = []
+    for start in (1, 4, 7):
+        rows.append([InlineKeyboardButton(str(number), callback_data=f"ui:code:{number}")
+                     for number in range(start, start + 3)])
+    rows.append([
+        InlineKeyboardButton(tr(language, "btn_erase"), callback_data="ui:code:back"),
+        InlineKeyboardButton("0", callback_data="ui:code:0"),
+        InlineKeyboardButton(tr(language, "btn_submit"), callback_data="ui:code:submit"),
+    ])
+    rows.append([InlineKeyboardButton(tr(language, "btn_auth_cancel"), callback_data="ui:auth_cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
 def language_keyboard():
@@ -433,7 +499,25 @@ async def render_panel(target, text, keyboard):
 async def show_main(target, user_id, welcome=False):
     language = user_language(user_id)
     text = tr(language, "welcome") + "\n\n" + tr(language, "main_title") if welcome else tr(language, "main_title")
-    await render_panel(target, text, main_keyboard(language))
+    await render_panel(target, text, main_keyboard(language, is_admin(user_id)))
+
+
+async def send_qr_panel(message, language, login_token, waiting=False):
+    login_url = "tg://login?token=" + base64.urlsafe_b64encode(login_token.token).decode().rstrip("=")
+    import qrcode
+    image = qrcode.make(login_url)
+    buffer = io.BytesIO()
+    buffer.name = "restdl-login.png"
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    caption = (tr(language, "qr_waiting") + "\n\n" if waiting else "") + tr(language, "scan_qr")
+    await message.reply_photo(
+        buffer, caption=caption,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(tr(language, "btn_scanned"), callback_data="ui:qr_complete")],
+            [InlineKeyboardButton(tr(language, "btn_auth_cancel"), callback_data="ui:auth_cancel")],
+        ]),
+    )
 
 
 async def handle_ui_callback(callback_query: CallbackQuery):
@@ -452,16 +536,16 @@ async def handle_ui_callback(callback_query: CallbackQuery):
         await show_main(callback_query.message, user_id)
     elif action == "download":
         await render_panel(callback_query.message, tr(language, "download_title"), download_keyboard(language))
+    elif action == "browse":
+        await render_panel(callback_query.message, tr(language, "browse_title"), browse_keyboard(language))
     elif action == "account":
-        connected = bool(db.get_telegram_credential(user_id))
-        await render_panel(callback_query.message, tr(language, "account_title"), account_keyboard(language, connected))
+        connected = bool(await connected_account(user_id))
+        await render_panel(
+            callback_query.message, tr(language, "account_title"),
+            account_keyboard(language, connected, is_admin(user_id) and bool(user)),
+        )
     elif action == "settings":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(tr(language, "btn_language"), callback_data="ui:language")],
-            [InlineKeyboardButton(tr(language, "btn_forward"), callback_data="ui:set_forward")],
-            [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
-        ])
-        await render_panel(callback_query.message, tr(language, "settings_title"), keyboard)
+        await render_panel(callback_query.message, tr(language, "settings_title"), settings_keyboard(language))
     elif action == "tools":
         await render_panel(callback_query.message, tr(language, "tools_title"), tools_keyboard(language))
     elif action == "help":
@@ -471,12 +555,19 @@ async def handle_ui_callback(callback_query: CallbackQuery):
     elif action == "language":
         await render_panel(callback_query.message, tr(language, "choose_language"), language_keyboard())
     elif action == "connect":
+        if is_admin(user_id) and user:
+            account = await connected_account(user_id)
+            await callback_query.message.reply(tr(
+                language, "admin_server_session", name=account.display_name,
+                username=account.username or "-",
+            ))
+            return
         if not secret_box.available:
             await callback_query.message.reply(tr(language, "invalid_setup", error="SESSION_ENCRYPTION_KEY is missing"))
             return
         db.set_conversation_state(user_id, "setup_api_id", expires_at=datetime.utcnow() + timedelta(minutes=15))
         await callback_query.message.reply(tr(language, "setup_intro") + "\n\n" + tr(language, "ask_api_id"))
-    elif action in {"setup_session", "setup_qr"}:
+    elif action in {"setup_session", "setup_qr", "setup_phone"}:
         state = db.get_conversation_state(user_id)
         if not state or state.state != "setup_method":
             await callback_query.message.reply(tr(language, "cancelled"))
@@ -487,36 +578,32 @@ async def handle_ui_callback(callback_query: CallbackQuery):
                 datetime.utcnow() + timedelta(minutes=15),
             )
             await callback_query.message.reply(tr(language, "ask_session"))
+        elif action == "setup_phone":
+            db.set_conversation_state(
+                user_id, "setup_phone_number", state.payload,
+                datetime.utcnow() + timedelta(minutes=15),
+            )
+            await callback_query.message.reply(tr(language, "ask_phone"))
         else:
             payload = _read_state_payload(state.payload)
             try:
                 login_token = await session_manager.begin_qr(
                     user_id, int(payload["api_id"]), payload["api_hash"]
                 )
-                login_url = "tg://login?token=" + base64.urlsafe_b64encode(login_token.token).decode().rstrip("=")
-                import qrcode
-                image = qrcode.make(login_url)
-                buffer = io.BytesIO()
-                buffer.name = "restdl-login.png"
-                image.save(buffer, format="PNG")
-                buffer.seek(0)
-                await callback_query.message.reply_photo(
-                    buffer, caption=tr(language, "scan_qr"),
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton(tr(language, "btn_scanned"), callback_data="ui:qr_complete")
-                    ]]),
-                )
+                await send_qr_panel(callback_query.message, language, login_token)
             except SessionPasswordNeeded:
+                db.set_conversation_state(user_id, "setup_qr_password", expires_at=datetime.utcnow() + timedelta(minutes=5))
                 await callback_query.message.reply(tr(language, "qr_2fa"))
             except Exception as exc:
                 logger.warning("QR setup failed for user %s: %s", user_id, exc)
                 await callback_query.message.reply(tr(language, "qr_error", error=str(exc)[:120]))
     elif action == "qr_complete":
         try:
-            account = await session_manager.complete_qr(user_id)
-            if not account:
-                await callback_query.message.reply(tr(language, "qr_waiting"))
+            result = await session_manager.complete_qr(user_id)
+            if isinstance(result, LoginToken):
+                await send_qr_panel(callback_query.message, language, result, waiting=True)
                 return
+            account = result
             db.clear_conversation_state(user_id)
             user_downloaders.pop(user_id, None)
             await callback_query.message.reply(tr(
@@ -524,14 +611,56 @@ async def handle_ui_callback(callback_query: CallbackQuery):
                 username=account.username or "-",
             ), reply_markup=main_keyboard(language))
         except SessionPasswordNeeded:
+            db.set_conversation_state(user_id, "setup_qr_password", expires_at=datetime.utcnow() + timedelta(minutes=5))
             await callback_query.message.reply(tr(language, "qr_2fa"))
         except Exception as exc:
             logger.warning("QR completion failed for user %s: %s", user_id, exc)
             await callback_query.message.reply(tr(language, "qr_error", error=str(exc)[:120]))
+    elif action.startswith("code:"):
+        state = db.get_conversation_state(user_id)
+        if not state or state.state != "setup_phone_code":
+            await callback_query.message.reply(tr(language, "auth_cancelled"))
+            return
+        payload = _read_state_payload(state.payload)
+        code = payload.get("code", "")
+        key = action.split(":", 1)[1]
+        if key == "back":
+            code = code[:-1]
+        elif key == "submit":
+            if not code:
+                await callback_query.message.reply(tr(language, "code_empty"), reply_markup=code_keyboard(language))
+                return
+            try:
+                account = await session_manager.submit_phone_code(user_id, code)
+                db.clear_conversation_state(user_id)
+                user_downloaders.pop(user_id, None)
+                await callback_query.message.reply(tr(
+                    language, "connected", name=account.display_name,
+                    username=account.username or "-",
+                ), reply_markup=main_keyboard(language, is_admin(user_id)))
+            except SessionPasswordNeeded:
+                db.set_conversation_state(user_id, "setup_phone_password", expires_at=datetime.utcnow() + timedelta(minutes=5))
+                await callback_query.message.reply(tr(language, "ask_password"))
+            except Exception as exc:
+                payload["code"] = ""
+                db.set_conversation_state(user_id, "setup_phone_code", _state_payload(payload), datetime.utcnow() + timedelta(minutes=10))
+                await callback_query.message.reply(tr(language, "invalid_setup", error=str(exc)[:120]), reply_markup=code_keyboard(language))
+            return
+        elif key.isdigit() and len(code) < 8:
+            code += key
+        payload["code"] = code
+        db.set_conversation_state(user_id, "setup_phone_code", _state_payload(payload), datetime.utcnow() + timedelta(minutes=10))
+        masked = "•" * len(code) if code else "—"
+        await render_panel(callback_query.message, tr(language, "code_sent", code=masked), code_keyboard(language))
+    elif action == "auth_cancel":
+        await session_manager.cancel_pending(user_id)
+        db.clear_conversation_state(user_id)
+        await callback_query.message.reply(tr(language, "auth_cancelled"), reply_markup=main_keyboard(language, is_admin(user_id)))
     elif action == "account_status":
-        account = await session_manager.get(user_id)
+        account = await connected_account(user_id)
         if account:
-            text = tr(language, "status_connected", name=account.display_name, username=account.username or "-")
+            key = "admin_server_session" if is_admin(user_id) and user else "status_connected"
+            text = tr(language, key, name=account.display_name, username=account.username or "-")
         else:
             text = tr(language, "status_disconnected")
         await callback_query.message.reply(text)
@@ -542,19 +671,22 @@ async def handle_ui_callback(callback_query: CallbackQuery):
         ]])
         await render_panel(callback_query.message, tr(language, "btn_disconnect") + "?", keyboard)
     elif action == "disconnect_yes":
+        if is_admin(user_id) and user:
+            await callback_query.message.reply(tr(language, "admin_disconnect_blocked"))
+            return
         await cancel_user_tasks(user_id)
         await session_manager.disconnect(user_id, erase=True)
         user_downloaders.pop(user_id, None)
         await callback_query.message.reply(tr(language, "session_removed"))
         await show_main(callback_query.message, user_id)
-    elif action in {"single", "bulk", "range", "set_forward"}:
-        if action != "set_forward" and not await session_manager.get(user_id):
+    elif action in {"single", "story", "bulk", "range", "set_forward"}:
+        if action != "set_forward" and not await connected_account(user_id):
             await callback_query.message.reply(tr(language, "not_connected"))
             return
-        state_map = {"single": "download_single", "bulk": "download_bulk", "range": "download_range", "set_forward": "set_forward"}
+        state_map = {"single": "download_single", "story": "download_single", "bulk": "download_bulk", "range": "download_range", "set_forward": "set_forward"}
         db.set_conversation_state(user_id, state_map[action], expires_at=datetime.utcnow() + timedelta(minutes=15))
         prompts = {
-            "single": tr(language, "ask_link"), "bulk": tr(language, "ask_bulk"),
+            "single": tr(language, "ask_link"), "story": tr(language, "ask_link"), "bulk": tr(language, "ask_bulk"),
             "range": tr(language, "ask_range"),
             "set_forward": tr(language, "ask_forward"),
         }
@@ -582,6 +714,63 @@ async def handle_ui_callback(callback_query: CallbackQuery):
         await callback_query.message.reply(tr(
             language, "stats", total=stats["total"], successful=stats["successful"],
             failed=stats["failed"], size=get_readable_file_size(stats["total_size"]),
+        ))
+    elif action == "getid":
+        await callback_query.message.reply(f"🆔 `{user_id}`")
+    elif action in {"browse_recent", "browse_latest", "browse_membership", "test_url"}:
+        if action != "test_url" and not await connected_account(user_id):
+            await callback_query.message.reply(tr(language, "not_connected"))
+            return
+        state_name = {
+            "browse_recent": "browse_recent", "browse_latest": "browse_latest",
+            "browse_membership": "browse_membership", "test_url": "test_url",
+        }[action]
+        db.set_conversation_state(user_id, state_name, expires_at=datetime.utcnow() + timedelta(minutes=15))
+        prompt = tr(language, "ask_test_url") if action == "test_url" else tr(language, "ask_browse")
+        await callback_query.message.reply(prompt)
+    elif action == "show_forward":
+        settings = db.get_user_settings(user_id)
+        status = (f"{settings.forward_chat_title or settings.forward_chat_id} (`{settings.forward_chat_id}`)"
+                  if settings and settings.forward_chat_id else tr(language, "forward_not_set"))
+        await callback_query.message.reply(tr(language, "settings_forward", status=status), reply_markup=settings_keyboard(language))
+    elif action == "clear_forward":
+        db.update_user_settings(user_id, forward_chat_id=None, forward_chat_title=None)
+        await callback_query.message.reply(tr(language, "forward_cleared"), reply_markup=settings_keyboard(language))
+    elif action == "test_forward":
+        settings = db.get_user_settings(user_id)
+        if not settings or not settings.forward_chat_id:
+            await callback_query.message.reply(tr(language, "forward_not_set"))
+            return
+        probe = await bot.send_message(settings.forward_chat_id, tr(language, "forward_probe"))
+        await probe.delete()
+        await callback_query.message.reply(tr(language, "forward_test_ok"))
+    elif action == "admin":
+        if not is_admin(user_id):
+            return
+        await render_panel(callback_query.message, tr(language, "admin_title"), admin_keyboard(language))
+    elif action == "admin_stats":
+        if not is_admin(user_id):
+            return
+        stats = db.get_stats()
+        active_tasks = sum(1 for tasks in USER_TASKS.values() for task in tasks if not task.done())
+        await callback_query.message.reply(tr(
+            language, "bot_stats_short", uptime=get_readable_time(time() - Config.BOT_START_TIME),
+            total=stats["total"], successful=stats["successful"], failed=stats["failed"],
+            tasks=active_tasks,
+        ))
+    elif action == "admin_logs":
+        if not is_admin(user_id):
+            return
+        log_files = sorted([f for f in os.listdir("logs") if f.endswith(".log")], reverse=True)
+        if log_files:
+            await callback_query.message.reply_document(os.path.join("logs", log_files[0]))
+    elif action == "admin_cleanup":
+        if not is_admin(user_id):
+            return
+        files_removed, bytes_freed = cleanup_old_downloads(7)
+        await callback_query.message.reply(tr(
+            language, "cleanup_done", files=files_removed,
+            size=get_readable_file_size(bytes_freed),
         ))
 
 
@@ -611,6 +800,8 @@ async def handle_conversation_input(_, message: Message):
             await message.reply(tr(language, "ask_api_hash"))
         elif state.state == "setup_api_hash":
             payload = _read_state_payload(state.payload)
+            if len(value) < 16:
+                raise ValueError("API hash is too short")
             payload["api_hash"] = value
             try:
                 await message.delete()
@@ -620,10 +811,42 @@ async def handle_conversation_input(_, message: Message):
                 user_id, "setup_method", _state_payload(payload),
                 datetime.utcnow() + timedelta(minutes=15),
             )
-            await message.reply(tr(language, "choose_login"), reply_markup=InlineKeyboardMarkup([[
+            await bot.send_message(user_id, tr(language, "choose_login"), reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(tr(language, "btn_qr"), callback_data="ui:setup_qr"),
+                InlineKeyboardButton(tr(language, "btn_phone"), callback_data="ui:setup_phone"),
+            ], [
                 InlineKeyboardButton(tr(language, "btn_import"), callback_data="ui:setup_session"),
             ]]))
+        elif state.state == "setup_phone_number":
+            payload = _read_state_payload(state.payload)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await session_manager.begin_phone(
+                user_id, int(payload["api_id"]), payload["api_hash"], value
+            )
+            db.set_conversation_state(
+                user_id, "setup_phone_code", _state_payload({"code": ""}),
+                datetime.utcnow() + timedelta(minutes=10),
+            )
+            await bot.send_message(
+                user_id,
+                tr(language, "code_sent", code="—"),
+                reply_markup=code_keyboard(language),
+            )
+        elif state.state == "setup_phone_code":
+            # Telegram invalidates login codes posted as chat messages. Keep the
+            # flow alive, remove the accidental message, and require callbacks.
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await bot.send_message(
+                user_id,
+                tr(language, "code_sent", code="—"),
+                reply_markup=code_keyboard(language),
+            )
         elif state.state == "setup_session":
             payload = _read_state_payload(state.payload)
             try:
@@ -635,10 +858,25 @@ async def handle_conversation_input(_, message: Message):
             )
             db.clear_conversation_state(user_id)
             user_downloaders.pop(user_id, None)
-            await message.reply(tr(
+            await bot.send_message(user_id, tr(
                 language, "connected", name=account.display_name,
                 username=account.username or "-",
-            ), reply_markup=main_keyboard(language))
+            ), reply_markup=main_keyboard(language, is_admin(user_id)))
+        elif state.state in {"setup_phone_password", "setup_qr_password"}:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            if state.state == "setup_phone_password":
+                account = await session_manager.submit_password(user_id, value)
+            else:
+                account = await session_manager.submit_qr_password(user_id, value)
+            db.clear_conversation_state(user_id)
+            user_downloaders.pop(user_id, None)
+            await bot.send_message(user_id, tr(
+                language, "connected", name=account.display_name,
+                username=account.username or "-",
+            ), reply_markup=main_keyboard(language, is_admin(user_id)))
         elif state.state in {"download_single", "download_bulk"}:
             instance = await get_user_downloader(user_id)
             if not instance:
@@ -651,7 +889,7 @@ async def handle_conversation_input(_, message: Message):
                 track_task(instance.download_media(message, value, destination), user_id)
             else:
                 track_task(instance.download_all_channel_media_optimized(message, value, destination), user_id)
-            await message.reply(tr(language, "queued"), reply_markup=main_keyboard(language))
+            await message.reply(tr(language, "queued"), reply_markup=main_keyboard(language, is_admin(user_id)))
         elif state.state == "set_forward":
             parsed = parse_chat_identifier(value)
             chat = await bot.get_chat(parsed)
@@ -664,7 +902,7 @@ async def handle_conversation_input(_, message: Message):
             db.clear_conversation_state(user_id)
             await message.reply(
                 tr(language, "forward_verified", destination=getattr(chat, "title", None) or chat.id),
-                reply_markup=main_keyboard(language),
+                reply_markup=main_keyboard(language, is_admin(user_id)),
             )
         elif state.state == "download_range":
             links = value.split()
@@ -683,7 +921,55 @@ async def handle_conversation_input(_, message: Message):
                 for message_id in range(start_id, end_id + 1):
                     await instance.download_media(message, f"{prefix}/{message_id}", destination)
             track_task(run_range(), user_id)
-            await message.reply(tr(language, "queued"), reply_markup=main_keyboard(language))
+            await message.reply(tr(language, "queued"), reply_markup=main_keyboard(language, is_admin(user_id)))
+        elif state.state in {"browse_recent", "browse_latest", "browse_membership"}:
+            account = await connected_account(user_id)
+            if not account:
+                await message.reply(tr(language, "not_connected"))
+                return
+            parsed = parse_chat_identifier(value)
+            chat = await resolve_chat(account.client, parsed)
+            reference = preferred_chat_reference(chat)
+            title = get_chat_title(chat)
+            if state.state == "browse_membership":
+                try:
+                    await account.client.get_chat_member(reference, "me")
+                    response = tr(language, "membership_yes", chat=title, chat_id=chat.id)
+                except Exception as exc:
+                    response = tr(language, "membership_no", error=str(exc)[:140])
+            elif state.state == "browse_latest":
+                latest = None
+                async for item in account.client.get_chat_history(reference, limit=1):
+                    latest = item
+                    break
+                if not latest:
+                    raise ValueError("No messages found")
+                link_ref = f"@{chat.username}" if getattr(chat, "username", None) else chat.id
+                response = tr(
+                    language, "latest_result", chat=title, message_id=latest.id,
+                    date=latest.date, media="✅" if latest.media else "❌",
+                    link=format_message_link(link_ref, latest.id),
+                )
+            else:
+                entries = []
+                link_ref = f"@{chat.username}" if getattr(chat, "username", None) else chat.id
+                async for item in account.client.get_chat_history(reference, limit=10):
+                    if item.media or item.text or item.caption:
+                        preview = (item.text or item.caption or "")[:80].replace("\n", " ")
+                        entries.append(f"`{item.id}` · {preview or 'media'}\n{format_message_link(link_ref, item.id)}")
+                    if len(entries) == 5:
+                        break
+                response = tr(language, "recent_title", chat=title) + "\n\n" + "\n\n".join(entries)
+            db.clear_conversation_state(user_id)
+            await message.reply(response, reply_markup=browse_keyboard(language), disable_web_page_preview=True)
+        elif state.state == "test_url":
+            result = debug_url(value)
+            db.clear_conversation_state(user_id)
+            await message.reply(tr(
+                language, "url_result", valid=result["is_valid"], type=result["type"],
+                chat=result["chat_id"], message=result["message_id"],
+                error=result["error"] or "-",
+            ), reply_markup=browse_keyboard(language))
     except Exception as exc:
         logger.exception("Interactive flow failed for user %s", user_id)
         await message.reply(tr(language, "invalid_setup", error=str(exc)[:160]))
@@ -702,17 +988,19 @@ async def route_legacy_commands_to_menu(_, message: Message):
     """Keep old links/bookmarks working without exposing a second, stale UI."""
     language = user_language(message.from_user.id)
     command = (message.command[0] if message.command else "").lower()
-    if command in {"dl", "dls", "bdl", "bdls", "downloadall", "list", "latest"}:
+    if command in {"dl", "dls", "bdl", "bdls", "downloadall"}:
         await message.reply(tr(language, "download_title"), reply_markup=download_keyboard(language))
+    elif command in {"list", "latest", "joincheck", "testurl"}:
+        await message.reply(tr(language, "browse_title"), reply_markup=browse_keyboard(language))
     elif command in {"settings", "setforward", "clearforward", "myforward", "testforwarding"}:
-        await message.reply(tr(language, "settings_title"), reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(tr(language, "btn_language"), callback_data="ui:language")],
-            [InlineKeyboardButton(tr(language, "btn_forward"), callback_data="ui:set_forward")],
-            [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
-        ]))
-    elif command in {"whoami", "joincheck"}:
-        connected = bool(db.get_telegram_credential(message.from_user.id))
-        await message.reply(tr(language, "account_title"), reply_markup=account_keyboard(language, connected))
+        await message.reply(tr(language, "settings_title"), reply_markup=settings_keyboard(language))
+    elif command == "whoami":
+        connected = bool(await connected_account(message.from_user.id))
+        await message.reply(tr(language, "account_title"), reply_markup=account_keyboard(
+            language, connected, is_admin(message.from_user.id) and bool(user)
+        ))
+    elif command in {"cleanup", "cleandb", "logs", "botstats"} and is_admin(message.from_user.id):
+        await message.reply(tr(language, "admin_title"), reply_markup=admin_keyboard(language))
     else:
         await message.reply(tr(language, "tools_title"), reply_markup=tools_keyboard(language))
     message.stop_propagation()
