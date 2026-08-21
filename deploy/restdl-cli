@@ -25,8 +25,15 @@ get_env() {
 
 authorize_admin() {
   local admin="$1" api_id="$2" api_hash="$3" admin_auth authorized_id admin_session
-  admin_auth="$(RESTDL_SETUP_API_ID="$api_id" RESTDL_SETUP_API_HASH="$api_hash" \
-    "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/generate_session.py" --machine)"
+  if ! admin_auth="$(RESTDL_SETUP_API_ID="$api_id" RESTDL_SETUP_API_HASH="$api_hash" \
+    "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/generate_session.py" --machine)"; then
+    echo "Administrator Telegram authorization failed; configuration was not changed." >&2
+    return 1
+  fi
+  [[ "$admin_auth" == *:* ]] || {
+    echo "Administrator authorization returned an invalid result; configuration was not changed." >&2
+    return 1
+  }
   authorized_id="${admin_auth%%:*}"
   admin_session="${admin_auth#*:}"
   [[ "$authorized_id" == "$admin" ]] || {
@@ -46,7 +53,9 @@ change_admin() {
   [[ "$admin" =~ ^[0-9]+$ ]] || { echo "Admin ID must be numeric."; return 1; }
   api_id="$(get_env API_ID)"
   api_hash="$(get_env API_HASH)"
-  admin_session="$(authorize_admin "$admin" "$api_id" "$api_hash")"
+  if ! admin_session="$(authorize_admin "$admin" "$api_id" "$api_hash")"; then
+    return 1
+  fi
   set_env ADMIN_USER_ID "$admin"
   set_env SESSION_STRING "$admin_session"
   systemctl restart "$SERVICE"
@@ -69,11 +78,15 @@ configure() {
   admin_session="$existing_session"
   if [[ -z "$existing_session" ]]; then
     echo "The administrator Telegram account must now be authorized."
-    admin_session="$(authorize_admin "$admin" "$api_id" "$api_hash")"
+    if ! admin_session="$(authorize_admin "$admin" "$api_id" "$api_hash")"; then
+      return 1
+    fi
   else
     read -rp "Re-authorize the existing administrator Telegram account? [y/N]: " relogin </dev/tty
     if [[ "$relogin" =~ ^[Yy]$ ]]; then
-      admin_session="$(authorize_admin "$admin" "$api_id" "$api_hash")"
+      if ! admin_session="$(authorize_admin "$admin" "$api_id" "$api_hash")"; then
+        return 1
+      fi
     fi
   fi
   [[ ${#admin_session} -ge 40 ]] || { echo "Admin Telegram authorization did not produce a valid session."; return 1; }

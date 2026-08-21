@@ -13,12 +13,16 @@ from pyrogram.errors import SessionPasswordNeeded
 def terminal_prompt(prompt: str, secret: bool = False) -> str:
     """Read from the controlling terminal even when install.sh is piped via curl."""
     if os.name != "nt" and os.path.exists("/dev/tty"):
-        with open("/dev/tty", "r+", encoding="utf-8", errors="replace") as terminal:
-            if secret:
-                return getpass.getpass(prompt, stream=terminal).strip()
-            terminal.write(prompt)
-            terminal.flush()
-            return terminal.readline().strip()
+        if secret:
+            # getpass opens /dev/tty itself and disables echo. Supplying an r+
+            # TextIOWrapper fails on some terminals because character devices
+            # are not seekable.
+            return getpass.getpass(prompt).strip()
+        with open("/dev/tty", "w", encoding="utf-8", errors="replace") as output:
+            output.write(prompt)
+            output.flush()
+        with open("/dev/tty", "r", encoding="utf-8", errors="replace") as input_stream:
+            return input_stream.readline().strip()
     return (getpass.getpass(prompt) if secret else input(prompt)).strip()
 
 
