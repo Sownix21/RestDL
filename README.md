@@ -65,7 +65,9 @@ python main.py
 ```
 
 Set at least `API_ID`, `API_HASH`, `BOT_TOKEN`, `ADMIN_USER_ID`, and `SESSION_ENCRYPTION_KEY`. The administrator must open the bot and press Start once so Telegram permits the bot to deliver mirrored downloads.
-The Linux configuration optionally accepts an administrator `SESSION_STRING`. When supplied, that account is attached automatically to the configured administrator and all download/browse features are immediately available to them; otherwise the administrator can connect through the same in-bot QR or phone flow as any user. Ordinary users never need Linux access.
+During installation, Linux immediately authorizes the administrator's Telegram account by asking for its phone number, delivered Telegram code, and optional two-step-verification password in the terminal. The generated `SESSION_STRING` is written to the root-owned configuration and attached automatically to `ADMIN_USER_ID` on first startup, so the administrator can download and browse immediately. Re-running **Configure** preserves the existing admin session unless the operator chooses to authorize it again. Ordinary users never need Linux access.
+
+The authorized account's Telegram numeric ID must match the configured `ADMIN_USER_ID`; setup aborts on a mismatch. The **Change admin** management action likewise authorizes and verifies the replacement account before applying it.
 
 ## User onboarding
 
