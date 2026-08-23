@@ -29,7 +29,7 @@ def terminal_prompt(prompt: str, secret: bool = False) -> str:
 async def authorize(api_id: int, api_hash: str):
     phone = terminal_prompt("Admin phone in international format (for example +989...): ")
     client = Client(
-        "restdl_admin_setup", api_id=api_id, api_hash=api_hash,
+        "dloader_admin_setup", api_id=api_id, api_hash=api_hash,
         in_memory=True, no_updates=True, workers=1,
     )
     try:
@@ -74,11 +74,11 @@ async def main():
     parser.add_argument("--machine", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.machine:
-        api_id = int(os.environ["RESTDL_SETUP_API_ID"])
-        api_hash = os.environ["RESTDL_SETUP_API_HASH"]
+        api_id = int(os.environ["DLOADER_SETUP_API_ID"])
+        api_hash = os.environ["DLOADER_SETUP_API_HASH"]
         print("Authorizing the Linux-managed administrator account...", file=sys.stderr)
     else:
-        print("RestrictiveDL secure session generator")
+        print("DLoader secure session generator")
         print("Run this only on a trusted device. Login secrets remain in this terminal.")
         api_id = int(terminal_prompt("API ID: "))
         api_hash = terminal_prompt("API hash (hidden): ", secret=True)

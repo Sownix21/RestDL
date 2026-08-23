@@ -1,19 +1,29 @@
 services:
-  restdl:
+  dloader:
     build: .
     restart: unless-stopped
     env_file: .env
     environment:
       DATA_DIR: /app/database
+      DOWNLOAD_DIR: /app/downloads
+      LOG_DIR: /app/logs
       DATABASE_URL: sqlite:////app/database/downloads.db
     volumes:
-      - restdl_data:/app/database
-      - restdl_downloads:/app/downloads
-      - restdl_logs:/app/logs
+      - dloader_data:/app/database
+      - dloader_downloads:/app/downloads
+      - dloader_logs:/app/logs
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    pids_limit: 256
+    mem_limit: 2g
 
 volumes:
-  restdl_data:
-  restdl_downloads:
-  restdl_logs:
+  dloader_data:
+  dloader_downloads:
+  dloader_logs:

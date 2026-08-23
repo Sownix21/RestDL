@@ -52,9 +52,10 @@ def check_single_instance():
         return None
 
 # ============ SETUP LOGGING ============
-os.makedirs("logs", exist_ok=True)
+runtime_log_dir = os.getenv("LOG_DIR", "logs")
+os.makedirs(runtime_log_dir, exist_ok=True)
 
-log_filename = f"logs/bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+log_filename = os.path.join(runtime_log_dir, f"bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,7 +149,7 @@ db = Database()
 # ============ INITIALIZE BOT CLIENTS ============
 
 bot = Client(
-    "media_bot",
+    "dloader_bot",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN,
@@ -189,7 +190,17 @@ def track_task(coro, user_id=None):
     RUNNING_TASKS.add(task)
     if user_id is not None:
         USER_TASKS.setdefault(user_id, set()).add(task)
-    def _remove(_):
+    def _remove(completed):
+        if not completed.cancelled():
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                error = None
+            if error is not None:
+                logger.error(
+                    "Background task failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
         if not SHUTDOWN_IN_PROGRESS:
             RUNNING_TASKS.discard(task)
             if user_id is not None:
@@ -211,6 +222,10 @@ async def cancel_user_tasks(user_id):
     return len(active)
 
 
+def can_queue_user_task(user_id):
+    return sum(1 for task in USER_TASKS.get(user_id, ()) if not task.done()) < Config.MAX_USER_TASKS
+
+
 def user_language(user_id):
     return db.get_user_profile(user_id).language
 
@@ -229,6 +244,7 @@ async def get_user_downloader(user_id):
     instance = Downloader(
         account.client, bot, download_semaphore,
         owner_user_id=user_id, admin_chat_id=Config.ADMIN_USER_ID,
+        database=db,
     )
     user_downloaders[user_id] = instance
     return instance
@@ -257,6 +273,106 @@ async def cancel_all_tasks():
             task.cancel()
             cancelled += 1
     return cancelled
+
+
+async def _send_admin_delivery(delivery):
+    caption = (delivery.caption or "")[:4096 if delivery.media_type == "text" else 1024]
+    if delivery.media_type == "text":
+        return await bot.send_message(
+            delivery.admin_chat_id, caption, parse_mode=ParseMode.DISABLED
+        )
+    path = delivery.file_path
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"Queued media file is missing: {path}")
+    methods = {
+        "photo": bot.send_photo, "video": bot.send_video,
+        "audio": bot.send_audio, "voice": bot.send_voice,
+        "video_note": bot.send_video_note, "sticker": bot.send_sticker,
+        "animation": bot.send_animation, "document": bot.send_document,
+    }
+    method = methods.get(delivery.media_type, bot.send_document)
+    media_key = {
+        "photo": "photo", "video": "video", "audio": "audio",
+        "voice": "voice", "video_note": "video_note", "sticker": "sticker",
+        "animation": "animation", "document": "document",
+    }.get(delivery.media_type, "document")
+    kwargs = {"chat_id": delivery.admin_chat_id, media_key: path}
+    if delivery.media_type not in {"video_note", "sticker"}:
+        kwargs.update(caption=caption, parse_mode=ParseMode.DISABLED)
+    if delivery.media_type == "video":
+        kwargs["supports_streaming"] = True
+    return await method(**kwargs)
+
+
+async def admin_delivery_worker():
+    """Durably retry required administrator mirrors."""
+    while True:
+        active_ids = session_manager.active_user_ids()
+        for active_user_id, tasks in list(USER_TASKS.items()):
+            if any(not task.done() for task in tasks):
+                session_manager.touch(active_user_id)
+        for stale_user_id in set(user_downloaders) - active_ids:
+            user_downloaders.pop(stale_user_id, None)
+        try:
+            pending_deliveries = db.get_pending_admin_deliveries(limit=20)
+        except Exception:
+            logger.exception("Could not load administrator delivery outbox")
+            await asyncio.sleep(30)
+            continue
+        for delivery in pending_deliveries:
+            try:
+                await _send_admin_delivery(delivery)
+                db.update_admin_delivery(
+                    delivery.id, status="sent", attempts=delivery.attempts + 1,
+                    error_message=None,
+                )
+                if delivery.file_path:
+                    try:
+                        os.remove(delivery.file_path)
+                    except FileNotFoundError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempts = delivery.attempts + 1
+                # Administrator mirrors are mandatory. Keep retrying durably;
+                # attempts remain visible for diagnostics and manual recovery.
+                try:
+                    db.update_admin_delivery(
+                        delivery.id, attempts=attempts, status="pending",
+                        next_attempt_at=datetime.utcnow() + timedelta(
+                            seconds=min(3600, 30 * (2 ** min(attempts, 7)))
+                        ),
+                        error_message=str(exc)[:500],
+                    )
+                except Exception:
+                    logger.exception("Could not update administrator delivery %s", delivery.id)
+                logger.warning("Admin delivery retry %s failed: %s", delivery.id, exc)
+        await asyncio.sleep(30)
+
+
+async def health_heartbeat_worker():
+    """Publish a small atomic heartbeat for installers and container probes."""
+    health_path = os.path.join(Config.DATA_DIR, "health.json")
+    os.makedirs(Config.DATA_DIR, exist_ok=True)
+    while True:
+        temporary = f"{health_path}.{os.getpid()}.tmp"
+        payload = {
+            "pid": os.getpid(),
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "bot_connected": bool(getattr(bot, "is_connected", False)),
+        }
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            os.replace(temporary, health_path)
+        finally:
+            try:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            except OSError:
+                pass
+        await asyncio.sleep(20)
 
 # ============ FORWARD CHAT SETUP ============
 
@@ -352,7 +468,7 @@ async def initialize_clients():
         if user:
             await user.start()
             user_me = await user.get_me()
-            logger.info(f"👤 Legacy server account started: @{user_me.username} (ID: {user_me.id})")
+            logger.info(f"👤 DLoader administrator account started: @{user_me.username} (ID: {user_me.id})")
             await session_manager.attach_external(Config.ADMIN_USER_ID, user)
 
         await bot.start()
@@ -462,6 +578,7 @@ def settings_keyboard(language):
 def admin_keyboard(language):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(tr(language, "btn_botstats"), callback_data="ui:admin_stats")],
+        [InlineKeyboardButton(tr(language, "btn_admin_delivery"), callback_data="ui:admin_delivery")],
         [InlineKeyboardButton(tr(language, "btn_logs"), callback_data="ui:admin_logs"),
          InlineKeyboardButton(tr(language, "btn_cleanup"), callback_data="ui:admin_cleanup")],
         [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
@@ -507,7 +624,7 @@ async def send_qr_panel(message, language, login_token, waiting=False):
     import qrcode
     image = qrcode.make(login_url)
     buffer = io.BytesIO()
-    buffer.name = "restdl-login.png"
+    buffer.name = "dloader-login.png"
     image.save(buffer, format="PNG")
     buffer.seek(0)
     caption = (tr(language, "qr_waiting") + "\n\n" if waiting else "") + tr(language, "scan_qr")
@@ -565,11 +682,15 @@ async def handle_ui_callback(callback_query: CallbackQuery):
         if not secret_box.available:
             await callback_query.message.reply(tr(language, "invalid_setup", error="SESSION_ENCRYPTION_KEY is missing"))
             return
+        await session_manager.cancel_pending(user_id)
         db.set_conversation_state(user_id, "setup_api_id", expires_at=datetime.utcnow() + timedelta(minutes=15))
         await callback_query.message.reply(tr(language, "setup_intro") + "\n\n" + tr(language, "ask_api_id"))
     elif action in {"setup_session", "setup_qr", "setup_phone"}:
         state = db.get_conversation_state(user_id)
-        if not state or state.state != "setup_method":
+        if (not state or state.state != "setup_method" or
+                (state.expires_at and state.expires_at < datetime.utcnow())):
+            await session_manager.cancel_pending(user_id)
+            db.clear_conversation_state(user_id)
             await callback_query.message.reply(tr(language, "cancelled"))
             return
         if action == "setup_session":
@@ -618,7 +739,10 @@ async def handle_ui_callback(callback_query: CallbackQuery):
             await callback_query.message.reply(tr(language, "qr_error", error=str(exc)[:120]))
     elif action.startswith("code:"):
         state = db.get_conversation_state(user_id)
-        if not state or state.state != "setup_phone_code":
+        if (not state or state.state != "setup_phone_code" or
+                (state.expires_at and state.expires_at < datetime.utcnow())):
+            await session_manager.cancel_pending(user_id)
+            db.clear_conversation_state(user_id)
             await callback_query.message.reply(tr(language, "auth_cancelled"))
             return
         payload = _read_state_payload(state.payload)
@@ -702,6 +826,25 @@ async def handle_ui_callback(callback_query: CallbackQuery):
         instance = user_downloaders.get(user_id)
         if instance:
             instance.clear_state()
+        else:
+            # Resume files outlive client objects and must also be removable
+            # after a restart or before the user reconnects their account.
+            state_path = os.path.join(
+                Config.DATA_DIR, "download_states", f"{user_id}.json"
+            )
+            for candidate in (state_path, f"{state_path}.tmp"):
+                try:
+                    os.remove(candidate)
+                except FileNotFoundError:
+                    pass
+            state_dir = os.path.dirname(state_path)
+            if os.path.isdir(state_dir):
+                for name in os.listdir(state_dir):
+                    if name.startswith(f"{user_id}_") and ".json" in name:
+                        try:
+                            os.remove(os.path.join(state_dir, name))
+                        except FileNotFoundError:
+                            pass
         db.clear_user_download_state(user_id)
         db.clear_conversation_state(user_id)
         await callback_query.message.reply(tr(language, "state_cleared"))
@@ -741,7 +884,8 @@ async def handle_ui_callback(callback_query: CallbackQuery):
         if not settings or not settings.forward_chat_id:
             await callback_query.message.reply(tr(language, "forward_not_set"))
             return
-        probe = await bot.send_message(settings.forward_chat_id, tr(language, "forward_probe"))
+        destination = parse_chat_identifier(settings.forward_chat_id)
+        probe = await bot.send_message(destination, tr(language, "forward_probe"))
         await probe.delete()
         await callback_query.message.reply(tr(language, "forward_test_ok"))
     elif action == "admin":
@@ -761,13 +905,22 @@ async def handle_ui_callback(callback_query: CallbackQuery):
     elif action == "admin_logs":
         if not is_admin(user_id):
             return
-        log_files = sorted([f for f in os.listdir("logs") if f.endswith(".log")], reverse=True)
+        log_files = sorted([f for f in os.listdir(Config.LOG_DIR) if f.endswith(".log")], reverse=True)
         if log_files:
-            await callback_query.message.reply_document(os.path.join("logs", log_files[0]))
+            await callback_query.message.reply_document(os.path.join(Config.LOG_DIR, log_files[0]))
+    elif action == "admin_delivery":
+        if not is_admin(user_id):
+            return
+        count = db.retry_admin_deliveries_now()
+        await callback_query.message.reply(tr(
+            language, "admin_delivery_retry", count=count
+        ))
     elif action == "admin_cleanup":
         if not is_admin(user_id):
             return
-        files_removed, bytes_freed = cleanup_old_downloads(7)
+        files_removed, bytes_freed = cleanup_old_downloads(
+            7, exclude_paths=db.get_pending_admin_file_paths()
+        )
         await callback_query.message.reply(tr(
             language, "cleanup_done", files=files_removed,
             size=get_readable_file_size(bytes_freed),
@@ -783,9 +936,9 @@ async def handle_conversation_input(_, message: Message):
     if not state:
         return
     if state.expires_at and state.expires_at < datetime.utcnow():
+        await session_manager.cancel_pending(user_id)
         db.clear_conversation_state(user_id)
         return
-    message.stop_propagation()
     language = user_language(user_id)
     value = message.text.strip()
     try:
@@ -878,6 +1031,9 @@ async def handle_conversation_input(_, message: Message):
                 username=account.username or "-",
             ), reply_markup=main_keyboard(language, is_admin(user_id)))
         elif state.state in {"download_single", "download_bulk"}:
+            if not can_queue_user_task(user_id):
+                await message.reply(tr(language, "queue_limit"))
+                return
             instance = await get_user_downloader(user_id)
             if not instance:
                 await message.reply(tr(language, "not_connected"))
@@ -905,6 +1061,9 @@ async def handle_conversation_input(_, message: Message):
                 reply_markup=main_keyboard(language, is_admin(user_id)),
             )
         elif state.state == "download_range":
+            if not can_queue_user_task(user_id):
+                await message.reply(tr(language, "queue_limit"))
+                return
             links = value.split()
             if len(links) != 2:
                 raise ValueError(tr(language, "range_two_required"))
@@ -913,6 +1072,9 @@ async def handle_conversation_input(_, message: Message):
             if start_chat != end_chat or start_id > end_id or end_id - start_id > 500:
                 raise ValueError(tr(language, "range_invalid"))
             instance = await get_user_downloader(user_id)
+            if not instance:
+                await message.reply(tr(language, "not_connected"))
+                return
             settings = db.get_user_settings(user_id)
             destination = settings.forward_chat_id if settings else None
             prefix = links[0].rsplit("/", 1)[0]
@@ -973,6 +1135,11 @@ async def handle_conversation_input(_, message: Message):
     except Exception as exc:
         logger.exception("Interactive flow failed for user %s", user_id)
         await message.reply(tr(language, "invalid_setup", error=str(exc)[:160]))
+    finally:
+        # Pyrogram implements stop_propagation() by raising StopPropagation.
+        # Calling it before the state machine silently aborted every API-ID,
+        # login, browse, forward and download input before it was processed.
+        message.stop_propagation()
 
 
 LEGACY_MENU_COMMANDS = [
@@ -1026,7 +1193,7 @@ async def start_command(_, message: Message):
     await ensure_forward_chat_setup()
     
     welcome_text = (
-        "🚀 **Enhanced Media Downloader Bot**\n\n"
+        "🚀 **DLoader**\n\n"
         "I can download media from any Telegram channel, even restricted ones!\n\n"
         "**📥 Features:**\n"
         "• Download posts, stories, and media groups\n"
@@ -1438,6 +1605,11 @@ async def handle_callback(bot: Client, callback_query: CallbackQuery):
     if data.startswith("ui:"):
         await handle_ui_callback(callback_query)
         return
+    # Retired buttons must not bypass current per-user limits or expose the
+    # obsolete English-only interface left in already-sent Telegram messages.
+    await callback_query.answer(tr(user_language(user_id), "menu_updated"), show_alert=True)
+    await show_main(callback_query.message, user_id)
+    return
     
     if data == "stats":
         stats = db.get_stats(user_id)
@@ -1922,9 +2094,9 @@ async def logs_command(_, message: Message):
     if not is_admin(message.from_user.id):
         return await message.reply("⛔ Admin only.")
     try:
-        log_files = sorted([f for f in os.listdir("logs") if f.endswith(".log")], reverse=True)
+        log_files = sorted([f for f in os.listdir(Config.LOG_DIR) if f.endswith(".log")], reverse=True)
         if log_files:
-            log_path = os.path.join("logs", log_files[0])
+            log_path = os.path.join(Config.LOG_DIR, log_files[0])
             await message.reply_document(document=log_path, caption="📋 **Bot Logs**")
             logger.info(f"Sent logs to user {message.from_user.id}")
         else:
@@ -2258,9 +2430,33 @@ async def bot_stats_command(_, message: Message):
     "setforward", "clearforward", "myforward"
 ]))
 async def handle_any_message(_, message: Message):
-    """Handle any non-command message (treat as link or chat ID)"""
-    language = user_language(message.from_user.id)
-    await message.reply(tr(language, "unknown"), reply_markup=main_keyboard(language))
+    """Download pasted Telegram links while keeping other text menu-driven."""
+    user_id = message.from_user.id
+    language = user_language(user_id)
+    value = (message.text or "").strip()
+    if is_valid_telegram_url(value):
+        if not can_queue_user_task(user_id):
+            await message.reply(tr(language, "queue_limit"))
+            return
+        instance = await get_user_downloader(user_id)
+        if not instance:
+            await message.reply(
+                tr(language, "not_connected"),
+                reply_markup=main_keyboard(language, is_admin(user_id)),
+            )
+            return
+        settings = db.get_user_settings(user_id)
+        destination = settings.forward_chat_id if settings else None
+        track_task(instance.download_media(message, value, destination), user_id)
+        await message.reply(
+            tr(language, "queued"),
+            reply_markup=main_keyboard(language, is_admin(user_id)),
+        )
+        return
+    await message.reply(
+        tr(language, "unknown"),
+        reply_markup=main_keyboard(language, is_admin(user_id)),
+    )
 
 # ============ INITIALIZATION ============
 
@@ -2270,6 +2466,8 @@ async def initialize():
     
     logger.info("="*60)
     configuration_errors = Config.validate()
+    if secret_box.error:
+        configuration_errors.append(secret_box.error)
     if configuration_errors:
         for error in configuration_errors:
             logger.error("Configuration: %s", error)
@@ -2282,9 +2480,13 @@ async def initialize():
         return False
     
     download_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_DOWNLOADS)
+    track_task(admin_delivery_worker())
+    track_task(session_manager.maintenance_loop())
+    track_task(health_heartbeat_worker())
     downloader = Downloader(
         user, bot, download_semaphore, owner_user_id=Config.ADMIN_USER_ID,
         admin_chat_id=Config.ADMIN_USER_ID,
+        database=db,
     ) if user else None
     
     # Setup forward chat after clients are ready
@@ -2305,6 +2507,9 @@ async def run_app():
     try:
         await idle()
     finally:
+        await cancel_all_tasks()
+        if RUNNING_TASKS:
+            await asyncio.gather(*list(RUNNING_TASKS), return_exceptions=True)
         await session_manager.close_all()
         if getattr(bot, "is_connected", False):
             await bot.stop()
@@ -2316,7 +2521,7 @@ async def run_app():
 if __name__ == "__main__":
     try:
         logger.info("="*50)
-        logger.info("🚀 Enhanced Media Downloader Bot Starting...")
+        logger.info("🚀 DLoader starting...")
         logger.info("="*50)
         
         # Let Pyrogram drive the loop used by its sessions and dispatcher.

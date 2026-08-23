@@ -3,10 +3,31 @@ import os
 import asyncio
 from time import time
 from typing import Optional, Tuple, Any
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait
 from logger import get_logger
-from helpers.files import get_readable_file_size, get_readable_time
+from helpers.files import (
+    check_file_size, get_readable_file_size, get_readable_time,
+    sanitize_filename,
+)
+from i18n import tr
+from config import Config
 
 logger = get_logger(__name__)
+_PROGRESS_UPDATES = {}
+
+
+def truncate_telegram_text(value: str, limit: int) -> str:
+    """Truncate text using Telegram's UTF-16 code-unit accounting."""
+    used = 0
+    output = []
+    for char in value or "":
+        width = 2 if ord(char) > 0xFFFF else 1
+        if used + width > limit:
+            break
+        output.append(char)
+        used += width
+    return "".join(output)
 
 # ============ PROGRESS FUNCTIONS ============
 
@@ -49,10 +70,17 @@ async def progress_for_pyrogram(current: int, total: int, text: str, message: An
                 f"**⏱️ Remaining:** {get_readable_time(remaining)}"
             )
             
-            # Update progress message every 2 seconds or when complete
-            if int(now) % 2 == 0 or current == total:
+            # Throttle per status message. The previous even-second check fired
+            # on every chunk callback for an entire second and caused edit floods.
+            progress_key = (getattr(getattr(message, "chat", None), "id", None),
+                            getattr(message, "id", id(message)))
+            last_update = _PROGRESS_UPDATES.get(progress_key, 0)
+            if now - last_update >= 2 or current >= total:
                 try:
                     await message.edit(progress_text)
+                    _PROGRESS_UPDATES[progress_key] = now
+                    if current >= total:
+                        _PROGRESS_UPDATES.pop(progress_key, None)
                 except Exception as e:
                     logger.debug(f"Failed to update progress: {e}")
                 
@@ -86,7 +114,10 @@ async def process_media_group(
     forward_only: bool = False,
     mirror_chat_id: Optional[int] = None,
     mirror_header: str = "",
-    owner_namespace: str = "legacy"
+    owner_namespace: str = "legacy",
+    max_file_size: Optional[int] = None,
+    mirror_failure_handler: Any = None,
+    language: str = "en",
 ) -> bool:
     """
     Process a media group (album) and download ALL media with proper handling.
@@ -111,7 +142,7 @@ async def process_media_group(
         
         if not media_group:
             logger.warning("No media group found")
-            await message.reply("❌ **No media group found**")
+            await message.reply(tr(language, "no_content"))
             return False
         
         total_items = len(media_group)
@@ -119,10 +150,10 @@ async def process_media_group(
         
         # Notify user about total items
         action = "Forwarding" if forward_only else "Downloading"
-        await message.reply(f"📸 **Media Group Detected**\nFound **{total_items}** media items. {action} all...")
+        await message.reply(tr(language, "album_starting", count=total_items))
         
         # Create download directory
-        download_dir = f"downloads/{owner_namespace}_{message.id}"
+        download_dir = os.path.join(Config.DOWNLOAD_DIR, f"{owner_namespace}_{message.id}")
         os.makedirs(download_dir, exist_ok=True)
         
         success_count = 0
@@ -130,6 +161,7 @@ async def process_media_group(
         
         for idx, msg in enumerate(media_group, 1):
             try:
+                item_delivered = False
                 # Generate filename based on media type
                 if msg.photo:
                     file_name = f"photo_{idx}_{msg.id}.jpg"
@@ -138,7 +170,9 @@ async def process_media_group(
                     file_name = f"video_{idx}_{msg.id}.mp4"
                     media_type = "video"
                 elif msg.document:
-                    file_name = msg.document.file_name or f"document_{idx}_{msg.id}.bin"
+                    file_name = sanitize_filename(
+                        msg.document.file_name, f"document_{idx}_{msg.id}.bin"
+                    )
                     media_type = "document"
                 elif msg.audio:
                     file_name = f"audio_{idx}_{msg.id}.mp3"
@@ -164,7 +198,15 @@ async def process_media_group(
                     file_name = f"media_{idx}_{msg.id}.bin"
                     media_type = "document"
                 
+                file_name = sanitize_filename(file_name)
                 download_path = os.path.join(download_dir, file_name)
+
+                declared_size = get_file_size(msg)
+                allowed, reason = await check_file_size(declared_size or 0, max_file_size)
+                if declared_size and not allowed:
+                    logger.warning("Skipping album item %s: %s", msg.id, reason)
+                    failed_count += 1
+                    continue
                 
                 # Download the media
                 logger.info(f"Downloading {idx}/{total_items}: {file_name}")
@@ -172,10 +214,17 @@ async def process_media_group(
                 
                 if media_path and os.path.exists(media_path):
                     file_size = os.path.getsize(media_path)
-                    success_count += 1
-                    
+                    allowed, reason = await check_file_size(file_size, max_file_size)
+                    if not allowed:
+                        logger.warning("Removing oversized album item %s: %s", msg.id, reason)
+                        os.remove(media_path)
+                        failed_count += 1
+                        continue
                     # Prepare caption
-                    caption = f"📸 **Media {idx}/{total_items}**\n📁 {file_name}\n📦 {get_readable_file_size(file_size)}"
+                    caption = truncate_telegram_text(
+                        f"📸 Media {idx}/{total_items}\n📁 {file_name}\n📦 {get_readable_file_size(file_size)}",
+                        1024,
+                    )
                     
                     # If forward_only is True, only forward to channel
                     if forward_only and forward_chat_id and bot:
@@ -222,6 +271,7 @@ async def process_media_group(
                                     caption=caption
                                 )
                             logger.info(f"Forwarded media {idx}/{total_items} to {forward_chat_id}")
+                            item_delivered = True
                         except FloodWait as e:
                             wait_time = e.value or 30
                             logger.warning(f"FloodWait on forward: waiting {wait_time}s")
@@ -246,9 +296,9 @@ async def process_media_group(
                                     document=media_path,
                                     caption=caption
                                 )
+                            item_delivered = True
                         except Exception as e:
                             logger.error(f"Failed to forward media {idx}: {e}")
-                            failed_count += 1
                     else:
                         # Send to user
                         try:
@@ -286,13 +336,23 @@ async def process_media_group(
                                     document=media_path,
                                     caption=caption
                                 )
+                            item_delivered = True
                         except Exception as e:
                             logger.error(f"Failed to send media {idx}: {e}")
-                            failed_count += 1
 
-                    if mirror_chat_id and mirror_chat_id != forward_chat_id and bot:
+                    if item_delivered:
+                        success_count += 1
+                    else:
+                        # A downloaded file is not a completed album item until
+                        # it reaches the requesting user's chosen destination.
+                        failed_count += 1
+
+                    retain_file = False
+                    if mirror_chat_id and bot:
                         try:
-                            mirror_caption = f"{mirror_header}\n\n{caption}"[:1024]
+                            mirror_caption = truncate_telegram_text(
+                                f"{mirror_header}\n\n{caption}", 1024
+                            )
                             if media_type == "photo":
                                 await bot.send_photo(mirror_chat_id, media_path, caption=mirror_caption)
                             elif media_type == "video":
@@ -309,10 +369,16 @@ async def process_media_group(
                                 await bot.send_document(mirror_chat_id, media_path, caption=mirror_caption)
                         except Exception as e:
                             logger.error(f"Failed to mirror album media {idx}: {e}")
+                            if mirror_failure_handler:
+                                await mirror_failure_handler(
+                                    media_path, media_type, mirror_caption, e
+                                )
+                                retain_file = True
                     
                     # Cleanup
                     try:
-                        os.remove(media_path)
+                        if not retain_file:
+                            os.remove(media_path)
                     except Exception as e:
                         logger.error(f"Failed to cleanup {media_path}: {e}")
                 else:
@@ -325,21 +391,18 @@ async def process_media_group(
         
         # Summary
         action = "Forwarded" if forward_only else "Downloaded"
-        summary = (
-            f"✅ **Media Group {action}!**\n\n"
-            f"📊 **Summary:**\n"
-            f"• Total Media: {total_items}\n"
-            f"• {action}: {success_count}\n"
-            f"• Failed: {failed_count}"
+        summary = tr(
+            language, "album_result", icon="✅" if success_count else "❌",
+            success=success_count, failed=failed_count,
         )
         await message.reply(summary)
         
         logger.info(f"Media group processed: {success_count}/{total_items} successful")
-        return success_count > 0
+        return success_count == total_items
         
     except Exception as e:
         logger.error(f"Error processing media group: {e}")
-        await message.reply(f"❌ **Error processing media group:** {str(e)[:100]}")
+        await message.reply(tr(language, "download_failed", error=str(e)[:100]))
         return False
 
 
@@ -372,13 +435,15 @@ async def send_media(
         Sent message object or None if failed
     """
     try:
+        caption = truncate_telegram_text(caption or "", 1024)
         # Determine the method to use based on media type
         if media_type == "photo":
             sent = await bot.send_photo(
                 chat_id=message.chat.id,
                 photo=media_path,
                 caption=caption,
-                caption_entities=entities
+                caption_entities=entities,
+                parse_mode=ParseMode.DISABLED,
             )
         elif media_type == "video":
             sent = await bot.send_video(
@@ -386,6 +451,7 @@ async def send_media(
                 video=media_path,
                 caption=caption,
                 caption_entities=entities,
+                parse_mode=ParseMode.DISABLED,
                 supports_streaming=True
             )
         elif media_type == "audio":
@@ -393,21 +459,24 @@ async def send_media(
                 chat_id=message.chat.id,
                 audio=media_path,
                 caption=caption,
-                caption_entities=entities
+                caption_entities=entities,
+                parse_mode=ParseMode.DISABLED,
             )
         elif media_type == "document":
             sent = await bot.send_document(
                 chat_id=message.chat.id,
                 document=media_path,
                 caption=caption,
-                caption_entities=entities
+                caption_entities=entities,
+                parse_mode=ParseMode.DISABLED,
             )
         elif media_type == "voice":
             sent = await bot.send_voice(
                 chat_id=message.chat.id,
                 voice=media_path,
                 caption=caption,
-                caption_entities=entities
+                caption_entities=entities,
+                parse_mode=ParseMode.DISABLED,
             )
         elif media_type == "video_note":
             sent = await bot.send_video_note(
@@ -419,7 +488,8 @@ async def send_media(
                 chat_id=message.chat.id,
                 animation=media_path,
                 caption=caption,
-                caption_entities=entities
+                caption_entities=entities,
+                parse_mode=ParseMode.DISABLED,
             )
         elif media_type == "sticker":
             sent = await bot.send_sticker(
@@ -431,7 +501,8 @@ async def send_media(
                 chat_id=message.chat.id,
                 document=media_path,
                 caption=caption or "Media file",
-                caption_entities=entities
+                caption_entities=entities,
+                parse_mode=ParseMode.DISABLED,
             )
         
         return sent
@@ -578,6 +649,8 @@ def get_file_size(chat_message: Any) -> Optional[int]:
     Returns:
         File size in bytes or None
     """
+    if chat_message.photo:
+        return chat_message.photo.file_size
     if chat_message.document:
         return chat_message.document.file_size
     elif chat_message.video:
@@ -720,4 +793,5 @@ __all__ = [
     'get_file_size',
     'extract_media_info',
     'get_media_display_name',
+    'truncate_telegram_text',
 ]

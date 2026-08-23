@@ -1,7 +1,7 @@
 # database.py
 import os
 import time
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Float, Text, text
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Float, Text, text, func, inspect, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -16,7 +16,7 @@ class DownloadHistory(Base):
     __tablename__ = 'download_history'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, nullable=False)
+    user_id = Column(BigInteger, nullable=False, index=True)
     chat_id = Column(String, nullable=False)
     message_id = Column(Integer, nullable=False)
     file_name = Column(String)
@@ -88,6 +88,39 @@ class DownloadJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
+
+class AdminDelivery(Base):
+    __tablename__ = "admin_deliveries"
+
+    id = Column(String, primary_key=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
+    admin_chat_id = Column(BigInteger, nullable=False)
+    file_path = Column(Text, nullable=True)
+    media_type = Column(String, nullable=False)
+    caption = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class DownloadJobItem(Base):
+    __tablename__ = "download_job_items"
+
+    job_id = Column(String, primary_key=True)
+    message_id = Column(Integer, primary_key=True)
+    status = Column(String, nullable=False, default="complete")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class SchemaMetadata(Base):
+    __tablename__ = "schema_metadata"
+
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=False)
+
 class Database:
     def __init__(self):
         os.makedirs(Config.DATA_DIR, exist_ok=True)
@@ -101,30 +134,64 @@ class Database:
         self.engine = create_engine(Config.DATABASE_URL, **engine_options)
         
         Base.metadata.create_all(self.engine)
+        self._run_compat_migrations()
         if Config.DATABASE_URL.startswith("sqlite"):
             with self.engine.begin() as connection:
                 connection.execute(text("PRAGMA journal_mode=WAL"))
                 connection.execute(text("PRAGMA synchronous=NORMAL"))
+                connection.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_download_history_user_time "
+                    "ON download_history (user_id, download_time)"
+                ))
         self.Session = sessionmaker(bind=self.engine)
+        self._record_schema_version("3")
+
+    def _run_compat_migrations(self):
+        """Apply additive migrations needed by databases from earlier releases."""
+        additions = {
+            "download_history": {
+                "error_message": "TEXT", "url": "TEXT",
+            },
+            "user_settings": {
+                "forward_chat_id": "VARCHAR(255)",
+                "forward_chat_title": "VARCHAR(255)",
+            },
+            "admin_deliveries": {
+                "next_attempt_at": "DATETIME",
+            },
+        }
+        schema = inspect(self.engine)
+        with self.engine.begin() as connection:
+            for table_name, columns in additions.items():
+                if not schema.has_table(table_name):
+                    continue
+                existing = {item["name"] for item in schema.get_columns(table_name)}
+                for column_name, sql_type in columns.items():
+                    if column_name not in existing:
+                        connection.execute(text(
+                            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {sql_type}"
+                        ))
+
+    def _record_schema_version(self, version):
+        session = self.Session()
+        try:
+            row = session.get(SchemaMetadata, "version")
+            if row:
+                row.value = str(version)
+            else:
+                session.add(SchemaMetadata(key="version", value=str(version)))
+            session.commit()
+        finally:
+            session.close()
     
     def get_session(self):
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                session = self.Session()
-                session.execute(text("SELECT 1"))
-                return session
-            except Exception as e:
-                error_msg = str(e)
-                if "database is locked" in error_msg and attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    logger.warning(f"Database locked, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                else:
-                    if attempt == max_retries - 1:
-                        logger.error(f"Failed to get database session after {max_retries} attempts: {e}")
-                    raise
-        return None
+        session = self.Session()
+        try:
+            session.execute(text("SELECT 1"))
+            return session
+        except Exception:
+            session.close()
+            raise
     
     def add_download_record(self, **kwargs):
         session = None
@@ -279,9 +346,15 @@ class Database:
     def clear_user_download_state(self, user_id):
         session = self.get_session()
         try:
+            job_ids = [
+                row[0] for row in session.query(DownloadJob.id).filter_by(user_id=user_id).all()
+            ]
+            if job_ids:
+                session.query(DownloadJobItem).filter(
+                    DownloadJobItem.job_id.in_(job_ids)
+                ).delete(synchronize_session=False)
             count = session.query(DownloadJob).filter(
-                DownloadJob.user_id == user_id,
-                DownloadJob.status.in_(["queued", "running", "paused", "failed"])
+                DownloadJob.user_id == user_id
             ).delete(synchronize_session=False)
             session.commit()
             return count
@@ -333,8 +406,7 @@ class Database:
             
             total = query.count()
             successful = query.filter_by(success=True).count()
-            total_size_query = query.with_entities(DownloadHistory.file_size).all()
-            total_size = sum(size[0] for size in total_size_query if size[0] and size[0] is not None)
+            total_size = query.with_entities(func.coalesce(func.sum(DownloadHistory.file_size), 0)).scalar()
             
             return {
                 'total': total,
@@ -348,6 +420,129 @@ class Database:
         finally:
             if session:
                 session.close()
+
+    def create_download_job(self, job_id, user_id, chat_id=None, total=0):
+        session = self.get_session()
+        try:
+            job = session.get(DownloadJob, job_id)
+            if not job:
+                job = DownloadJob(id=job_id, user_id=user_id)
+                session.add(job)
+            job.chat_id = str(chat_id) if chat_id is not None else None
+            job.status = "running"
+            job.total = max(job.total or 0, total or 0)
+            job.error_message = None
+            session.commit()
+            return job_id
+        finally:
+            session.close()
+
+    def update_download_job(self, job_id, **kwargs):
+        session = self.get_session()
+        try:
+            job = session.get(DownloadJob, job_id)
+            if not job:
+                return False
+            for key, value in kwargs.items():
+                if hasattr(job, key):
+                    setattr(job, key, value)
+            job.updated_at = datetime.utcnow()
+            session.commit()
+            return True
+        finally:
+            session.close()
+
+    def enqueue_admin_delivery(self, delivery_id, user_id, admin_chat_id,
+                               file_path, media_type, caption, error_message=None):
+        session = self.get_session()
+        try:
+            session.add(AdminDelivery(
+                id=delivery_id, user_id=user_id, admin_chat_id=admin_chat_id,
+                file_path=file_path, media_type=media_type, caption=caption,
+                error_message=error_message, status="pending",
+            ))
+            session.commit()
+            return delivery_id
+        finally:
+            session.close()
+
+    def get_pending_admin_deliveries(self, limit=20):
+        session = self.get_session()
+        try:
+            rows = session.query(AdminDelivery).filter(
+                AdminDelivery.status == "pending",
+                or_(AdminDelivery.next_attempt_at.is_(None),
+                    AdminDelivery.next_attempt_at <= datetime.utcnow()),
+            ).order_by(
+                AdminDelivery.created_at.asc()
+            ).limit(limit).all()
+            for row in rows:
+                session.expunge(row)
+            return rows
+        finally:
+            session.close()
+
+    def update_admin_delivery(self, delivery_id, **kwargs):
+        session = self.get_session()
+        try:
+            row = session.get(AdminDelivery, delivery_id)
+            if not row:
+                return False
+            for key, value in kwargs.items():
+                if hasattr(row, key):
+                    setattr(row, key, value)
+            row.updated_at = datetime.utcnow()
+            session.commit()
+            return True
+        finally:
+            session.close()
+
+    def retry_admin_deliveries_now(self):
+        session = self.get_session()
+        try:
+            count = session.query(AdminDelivery).filter_by(status="pending").update(
+                {AdminDelivery.next_attempt_at: None}, synchronize_session=False
+            )
+            session.commit()
+            return count
+        finally:
+            session.close()
+
+    def get_pending_admin_file_paths(self):
+        session = self.get_session()
+        try:
+            return {
+                row[0] for row in session.query(AdminDelivery.file_path).filter(
+                    AdminDelivery.status == "pending",
+                    AdminDelivery.file_path.is_not(None),
+                ).all()
+            }
+        finally:
+            session.close()
+
+    def get_completed_job_items(self, job_id):
+        session = self.get_session()
+        try:
+            return {
+                row[0] for row in session.query(DownloadJobItem.message_id).filter_by(
+                    job_id=job_id, status="complete"
+                ).all()
+            }
+        finally:
+            session.close()
+
+    def mark_job_item_complete(self, job_id, message_id):
+        session = self.get_session()
+        try:
+            row = session.get(DownloadJobItem, (job_id, int(message_id)))
+            if not row:
+                session.add(DownloadJobItem(job_id=job_id, message_id=int(message_id)))
+            else:
+                row.status = "complete"
+                row.updated_at = datetime.utcnow()
+            session.commit()
+        finally:
+            session.close()
     
     def get_download_history(self, user_id, limit=10):
         session = None
@@ -374,5 +569,6 @@ class Database:
 
 __all__ = [
     'Database', 'DownloadHistory', 'UserSettings', 'UserProfile',
-    'TelegramCredential', 'ConversationState', 'DownloadJob'
+    'TelegramCredential', 'ConversationState', 'DownloadJob',
+    'AdminDelivery', 'DownloadJobItem', 'SchemaMetadata'
 ]

@@ -9,7 +9,12 @@ from config import Config
 class SecretBox:
     def __init__(self, key: Optional[str] = None):
         raw_key = (key or Config.SESSION_ENCRYPTION_KEY).strip()
-        self._fernet = Fernet(raw_key.encode("ascii")) if raw_key else None
+        self.error = None
+        try:
+            self._fernet = Fernet(raw_key.encode("ascii")) if raw_key else None
+        except (ValueError, UnicodeError) as exc:
+            self._fernet = None
+            self.error = f"SESSION_ENCRYPTION_KEY is invalid: {exc}"
 
     @property
     def available(self) -> bool:

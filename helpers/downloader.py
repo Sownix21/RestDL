@@ -3,12 +3,19 @@ import os
 import asyncio
 import re
 import json
+import hashlib
+import uuid
+from pathlib import Path
 from contextlib import asynccontextmanager
 from time import time
 from datetime import datetime
 from typing import Optional, Any, Tuple, Union
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, PeerIdInvalid, BadRequest
-from helpers.files import get_download_path, cleanup_download, get_readable_file_size, get_readable_time
+from helpers.files import (
+    get_download_path, cleanup_download, get_readable_file_size,
+    get_readable_time, check_file_size,
+)
 from helpers.msg import (
     get_file_name, 
     get_raw_text, 
@@ -18,7 +25,8 @@ from helpers.msg import (
     getStoryChatMsgID,
     is_story_link,
     get_story_file_name,
-    parse_chat_identifier
+    parse_chat_identifier,
+    format_message_link,
 )
 from helpers.chats import resolve_chat, preferred_chat_reference, chat_title as get_chat_title
 from helpers.utils import (
@@ -29,14 +37,15 @@ from helpers.utils import (
     get_media_type,
     get_file_size,
     process_media_group,
-    extract_media_info
+    extract_media_info,
+    truncate_telegram_text,
 )
 from logger import get_logger
 from database import Database
 from config import Config
+from i18n import tr
 
 logger = get_logger(__name__)
-db = Database()
 
 
 @asynccontextmanager
@@ -45,10 +54,11 @@ async def _existing_download_slot():
     yield
 
 class DownloadState:
-    def __init__(self, owner_user_id=None):
+    def __init__(self, owner_user_id=None, namespace=None):
         state_dir = os.path.join(Config.DATA_DIR, "download_states")
         os.makedirs(state_dir, exist_ok=True)
-        state_name = f"{owner_user_id}.json" if owner_user_id is not None else "legacy.json"
+        suffix = f"_{namespace}" if namespace else ""
+        state_name = f"{owner_user_id}{suffix}.json" if owner_user_id is not None else "legacy.json"
         self.state_file = os.path.join(state_dir, state_name)
         self.current_chat_id = None
         self.current_media_index = 0
@@ -134,7 +144,7 @@ class DownloadState:
 
 class Downloader:
     def __init__(self, user_client, bot_client, download_semaphore,
-                 owner_user_id=None, admin_chat_id=None):
+                 owner_user_id=None, admin_chat_id=None, database=None):
         self.user = user_client
         self.bot = bot_client
         self.semaphore = download_semaphore
@@ -145,13 +155,48 @@ class Downloader:
         self.flood_wait_count = 0
         self.owner_user_id = owner_user_id
         self.admin_chat_id = admin_chat_id
+        self.db = database or Database()
         self.state = DownloadState(owner_user_id)
         self._resuming = False
         self._consecutive_floods = 0
         self._forward_chat_cache = {}  # chat_id -> (can_access, checked_at)
+        self._bulk_lock = asyncio.Lock()
+        self._active_job_id = None
 
     def clear_state(self):
         self.state.clear()
+        state_dir = Path(Config.DATA_DIR) / "download_states"
+        if state_dir.exists():
+            candidates = list(state_dir.glob(f"{self.owner_user_id}.json*"))
+            candidates.extend(state_dir.glob(f"{self.owner_user_id}_*.json*"))
+            for path in candidates:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def max_file_size_for(self, user_id: int) -> int:
+        settings = self.db.get_user_settings(user_id)
+        user_limit = getattr(settings, "max_file_size", None) or Config.MAX_FILE_SIZE
+        return min(int(user_limit), int(Config.MAX_FILE_SIZE))
+
+    def _t(self, message, key, **kwargs):
+        language = self.db.get_user_profile(message.from_user.id).language
+        return tr(language, key, **kwargs)
+
+    async def _ensure_size_allowed(self, message, file_size: Optional[int]) -> bool:
+        if not file_size:
+            return True
+        allowed, reason = await check_file_size(
+            file_size, self.max_file_size_for(message.from_user.id)
+        )
+        if not allowed:
+            await message.reply(self._t(
+                message, "file_too_large",
+                size=get_readable_file_size(file_size),
+                maximum=get_readable_file_size(self.max_file_size_for(message.from_user.id)),
+            ))
+        return allowed
 
     def _admin_caption(self, message, chat_message, caption):
         requester = message.from_user
@@ -167,20 +212,40 @@ class Downloader:
             f"📍 Source: {source} (`{chat_message.chat.id}`)\n"
             f"💬 Message: `{chat_message.id}`\n\n"
         )
-        combined = header + (caption or "")
-        return combined[:1024]
+        return truncate_telegram_text(header + (caption or ""), 1024)
 
     async def _mirror_media_to_admin(self, message, chat_message, media_path,
                                      media_type, caption, caption_entities=None):
         if not self.admin_chat_id or self.owner_user_id == self.admin_chat_id:
-            return
+            return True
         try:
-            await self._forward_media(
+            delivered = await self._forward_media(
                 self.admin_chat_id, media_path, media_type,
                 self._admin_caption(message, chat_message, caption), None,
             )
+            if not delivered:
+                raise RuntimeError("administrator destination rejected the media")
+            return True
         except Exception as exc:
             logger.error("Admin mirror failed for user %s: %s", self.owner_user_id, exc)
+            delivery_id = uuid.uuid4().hex
+            self.db.enqueue_admin_delivery(
+                delivery_id, self.owner_user_id, self.admin_chat_id,
+                os.path.abspath(media_path), media_type,
+                self._admin_caption(message, chat_message, caption), str(exc)[:500],
+            )
+            logger.warning("Queued administrator delivery %s for retry", delivery_id)
+            return False
+
+    async def _queue_admin_file(self, media_path, media_type, caption, error):
+        delivery_id = uuid.uuid4().hex
+        self.db.enqueue_admin_delivery(
+            delivery_id, self.owner_user_id, self.admin_chat_id,
+            os.path.abspath(media_path), media_type,
+            truncate_telegram_text(caption or "", 1024), str(error)[:500],
+        )
+        logger.warning("Queued administrator album delivery %s", delivery_id)
+        return delivery_id
     
     def _extract_wait_time(self, error_message: str) -> Optional[int]:
         patterns = [
@@ -211,16 +276,8 @@ class Downloader:
         
         if status_msg:
             try:
-                await status_msg.edit(
-                    f"⏸️ **RATE LIMITED - PAUSED**\n\n"
-                    f"**Wait Required:** {wait_time:,} seconds (~{wait_time/60:.1f} minutes)\n"
-                    f"**Context:** {context}\n"
-                    f"**FloodWait #:** {self.flood_wait_count}\n"
-                    f"**Resume from:** {self.state.current_media_index:,}/{self.state.total_media:,}\n\n"
-                    f"📌 State saved - will resume exactly where we left off\n"
-                    f"⏳ Waiting...\n\n"
-                    f"**Countdown:** {wait_time:,}s remaining"
-                )
+                language = self.db.get_user_profile(self.owner_user_id).language
+                await status_msg.edit(tr(language, "rate_wait", seconds=wait_time))
             except Exception as e:
                 logger.error(f"Failed to update status message: {e}")
         
@@ -229,16 +286,8 @@ class Downloader:
             if remaining % 10 == 0 or remaining < 10:
                 if status_msg:
                     try:
-                        progress = int((wait_time - remaining) / wait_time * 20)
-                        bar = "█" * progress + "░" * (20 - progress)
-                        await status_msg.edit(
-                            f"⏸️ **RATE LIMITED - PAUSED**\n\n"
-                            f"```{bar} {int((wait_time - remaining) / wait_time * 100)}%```\n"
-                            f"**Time Remaining:** {remaining:,} seconds\n"
-                            f"**Total Wait:** {wait_time:,} seconds\n"
-                            f"**Resume from:** {self.state.current_media_index:,}/{self.state.total_media:,}\n\n"
-                            f"⏳ Please wait. Bot will auto-resume."
-                        )
+                        language = self.db.get_user_profile(self.owner_user_id).language
+                        await status_msg.edit(tr(language, "rate_wait", seconds=remaining))
                     except Exception as e:
                         logger.error(f"Failed to update status message: {e}")
             await asyncio.sleep(1)
@@ -251,12 +300,8 @@ class Downloader:
         
         if status_msg:
             try:
-                await status_msg.edit(
-                    f"▶️ **RESUMING**\n\n"
-                    f"Context: {context}\n"
-                    f"Total Wait: {wait_time:,} seconds\n"
-                    f"Resuming from: {self.state.current_media_index:,}/{self.state.total_media:,}"
-                )
+                language = self.db.get_user_profile(self.owner_user_id).language
+                await status_msg.edit(tr(language, "download_progress"))
             except Exception as e:
                 logger.error(f"Failed to update status message: {e}")
             await asyncio.sleep(1)
@@ -270,11 +315,8 @@ class Downloader:
             if wait_time > 0:
                 if status_msg:
                     try:
-                        await status_msg.edit(
-                            f"⏸️ **PAUSED**\n\n"
-                            f"Remaining: {wait_time:,} seconds\n"
-                            f"⏳ Please wait. Bot will auto-resume."
-                        )
+                        language = self.db.get_user_profile(self.owner_user_id).language
+                        await status_msg.edit(tr(language, "rate_wait", seconds=wait_time))
                     except Exception as e:
                         logger.error(f"Failed to update status message: {e}")
                 await asyncio.sleep(wait_time + 1)
@@ -351,10 +393,12 @@ class Downloader:
     async def get_user_forward_chat(self, user_id):
         """Get the user's configured forward chat"""
         try:
-            settings = db.get_user_settings(user_id)
+            settings = self.db.get_user_settings(user_id)
             if settings and settings.forward_chat_id:
+                stored_id = str(settings.forward_chat_id).strip()
+                chat_id = int(stored_id) if stored_id.lstrip("-").isdigit() else stored_id
                 return {
-                    'chat_id': settings.forward_chat_id,
+                    'chat_id': chat_id,
                     'title': settings.forward_chat_title or settings.forward_chat_id
                 }
             return None
@@ -419,12 +463,6 @@ class Downloader:
                         cleanup_download(result)
                         return None
                     
-                    if track_resume:
-                        self.state.mark_completed(msg_id)
-                        self.state.current_media_index += 1
-                        self.state.save()
-                        logger.info(f"✅ Downloaded and marked completed: {msg_id}")
-                    
                     return result
                 return None
                 
@@ -480,7 +518,7 @@ class Downloader:
     async def _check_channel_access(self, chat_id: Union[int, str], message) -> bool:
         """Check if user can access the channel"""
         if self.user is None:
-            await message.reply("❌ **User client not initialized**")
+            await message.reply(self._t(message, "not_connected"))
             return False
         
         try:
@@ -490,21 +528,13 @@ class Downloader:
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Cannot access chat {chat_id}: {error_msg}")
-            await message.reply(
-                f"❌ **Cannot Access Channel**\n\n"
-                f"**Chat ID:** `{chat_id}`\n"
-                f"**Error:** `{error_msg}`\n\n"
-                f"**Solutions:**\n"
-                f"1. Make sure your account is a member of this channel\n"
-                f"2. Check if the chat ID is correct\n"
-                f"3. Try the full URL instead of just the ID"
-            )
+            await message.reply(self._t(message, "cannot_access", error=error_msg[:180]))
             return False
 
     # ============ MAIN DOWNLOAD METHODS ============
 
     async def download_media(self, message, url_or_id, forward_chat_id=None,
-                             _semaphore_acquired=False):
+                             _semaphore_acquired=False, _retry=0):
         """Main download function with forward chat support."""
         slot = _existing_download_slot() if _semaphore_acquired else self.semaphore
         async with slot:
@@ -523,13 +553,14 @@ class Downloader:
                 if effective_forward_chat_id:
                     has_access = await self._check_forward_chat_access(effective_forward_chat_id)
                     if not has_access:
-                        logger.warning(f"❌ Forward chat {effective_forward_chat_id} not accessible, disabling forwarding")
-                        effective_forward_chat_id = None
+                        logger.warning("Forward chat %s is not accessible", effective_forward_chat_id)
+                        await message.reply(self._t(message, "forward_unavailable"))
+                        return False
                 
                 # Make sure user client is available
                 if self.user is None:
-                    await message.reply("❌ **User client not initialized**")
-                    return
+                    await message.reply(self._t(message, "not_connected"))
+                    return False
                 
                 if not self.user_me:
                     try:
@@ -537,8 +568,8 @@ class Downloader:
                         logger.info(f"User client: {self.user_me.first_name} (@{self.user_me.username})")
                     except Exception as e:
                         logger.error(f"Failed to get user info: {e}")
-                        await message.reply("❌ **Failed to get user info**")
-                        return
+                        await message.reply(self._t(message, "download_failed", error=str(e)[:180]))
+                        return False
                 
                 chat_id, message_id = await self._parse_input(url_or_id)
                 story_request = is_story_link(url_or_id)
@@ -551,33 +582,32 @@ class Downloader:
                 except Exception as e:
                     error_msg = str(e)
                     logger.error(f"Cannot access chat {chat_id}: {error_msg}")
-                    await message.reply(
-                        f"❌ **Cannot Access Channel**\n\n"
-                        f"**Chat ID:** `{chat_id}`\n"
-                        f"**Error:** `{error_msg}`\n\n"
-                        f"**Make sure your account is a member of this channel.**"
-                    )
-                    return
+                    await message.reply(self._t(message, "cannot_access", error=error_msg[:180]))
+                    return False
                 
                 if message_id is None:
                     message_id = await self._get_latest_message_id(chat_id)
                     if not message_id:
-                        await message.reply("❌ **No messages found**")
-                        return
+                        await message.reply(self._t(message, "no_messages"))
+                        return False
 
                 if story_request:
                     story = await self.user.get_stories(chat_id, story_ids=message_id)
                     if isinstance(story, list):
                         story = story[0] if story else None
                     if not story:
-                        await message.reply("❌ **Story not found or expired**")
-                        return
+                        await message.reply(self._t(message, "story_missing"))
+                        return False
+                    if not await self._ensure_size_allowed(message, get_file_size(story)):
+                        return False
                     return await self._handle_story(story, message, effective_forward_chat_id)
                 
                 chat_message = await self._get_message(chat_id, message_id)
                 if not chat_message:
-                    await message.reply("❌ **Message not found**")
-                    return
+                    await message.reply(self._t(message, "message_missing"))
+                    return False
+                if not await self._ensure_size_allowed(message, get_file_size(chat_message)):
+                    return False
                 
                 if hasattr(chat_message, 'story') and chat_message.story:
                     return await self._handle_story(chat_message, message, effective_forward_chat_id)
@@ -596,18 +626,24 @@ class Downloader:
                 if wait_time is None:
                     wait_time = e.value if hasattr(e, 'value') else 30
                 await self._handle_flood_wait(wait_time, None, "Main download")
+                if _retry >= 2:
+                    await message.reply(self._t(message, "rate_limit_failed"))
+                    return False
                 return await self.download_media(
-                    message, url_or_id, forward_chat_id, _semaphore_acquired=True
+                    message, url_or_id, forward_chat_id,
+                    _semaphore_acquired=True, _retry=_retry + 1,
                 )
                 
             except Exception as e:
                 logger.error(f"Download error: {e}")
-                await message.reply(f"❌ **Error:** {str(e)[:200]}")
+                await message.reply(self._t(message, "download_failed", error=str(e)[:200]))
+                return False
 
-    async def _download_and_send(self, chat_message, message, forward_chat_id=None):
+    async def _download_and_send(self, chat_message, message, forward_chat_id=None, _retry=0):
         """Download and send a single file."""
         start_time = time()
-        progress_message = await message.reply("📥 **Starting download...**")
+        progress_message = await message.reply(self._t(message, "download_starting"))
+        media_path = None
         
         await self._wait_if_paused(progress_message)
         
@@ -631,19 +667,23 @@ class Downloader:
             )
             
             if media_path == "already_downloaded":
-                await progress_message.edit(f"✅ **Already downloaded:** {filename}")
+                await progress_message.edit(self._t(message, "download_already", name=filename))
                 await progress_message.delete()
-                return
+                return True
             
             if not media_path or not os.path.exists(media_path):
-                await progress_message.edit("❌ **Download failed**")
-                return
+                await progress_message.edit(self._t(message, "download_failed", error="-"))
+                return False
             
             file_size = os.path.getsize(media_path)
             if file_size == 0:
                 cleanup_download(media_path)
-                await progress_message.edit("❌ **Downloaded file is empty**")
-                return
+                await progress_message.edit(self._t(message, "download_empty"))
+                return False
+            if not await self._ensure_size_allowed(message, file_size):
+                cleanup_download(media_path)
+                await progress_message.delete()
+                return False
             
             logger.info(f"✅ Downloaded: {filename} ({get_readable_file_size(file_size)})")
             
@@ -656,13 +696,13 @@ class Downloader:
                 caption = f"📁 **File:** {filename}\n📦 **Size:** {get_readable_file_size(file_size)}"
             
             media_type = get_media_type(chat_message) or "document"
-            
+            delivery_succeeded = True
             if forward_chat_id:
                 try:
                     chat_title = chat_message.chat.title if hasattr(chat_message.chat, 'title') else chat_message.chat.id
                     caption_with_channel = f"📌 **{chat_title}**\n\n{caption}"
-                    await self._forward_media(forward_chat_id, media_path, media_type, caption_with_channel, caption_entities)
-                    await progress_message.edit(f"✅ **Forwarded:** {filename}")
+                    await self._forward_media(forward_chat_id, media_path, media_type, caption_with_channel, None)
+                    await progress_message.edit(self._t(message, "download_sent", name=filename))
                 except FloodWait as e:
                     wait_time = e.value if hasattr(e, 'value') else 30
                     logger.warning(f"⏳ FloodWait on forward: {wait_time}s")
@@ -670,55 +710,72 @@ class Downloader:
                     # Retry once
                     chat_title = chat_message.chat.title if hasattr(chat_message.chat, 'title') else chat_message.chat.id
                     caption_with_channel = f"📌 **{chat_title}**\n\n{caption}"
-                    await self._forward_media(forward_chat_id, media_path, media_type, caption_with_channel, caption_entities)
-                    await progress_message.edit(f"✅ **Forwarded:** {filename}")
+                    await self._forward_media(forward_chat_id, media_path, media_type, caption_with_channel, None)
+                    await progress_message.edit(self._t(message, "download_sent", name=filename))
                 except Exception as e:
-                    await progress_message.edit(f"❌ **Failed to forward:** {str(e)[:100]}")
+                    delivery_succeeded = False
+                    await progress_message.edit(self._t(message, "forward_failed", error=str(e)[:100]))
             else:
-                await send_media_with_retry(
+                sent = await send_media_with_retry(
                     self.bot, message, media_path, media_type,
                     caption, caption_entities,
                     progress_message, start_time,
                     None
                 )
+                delivery_succeeded = bool(sent)
 
-            if self.admin_chat_id != forward_chat_id:
-                await self._mirror_media_to_admin(
-                    message, chat_message, media_path, media_type, caption, caption_entities
-                )
+            mirror_delivered = await self._mirror_media_to_admin(
+                message, chat_message, media_path, media_type, caption, caption_entities
+            )
             
-            db.add_download_record(
+            self.db.add_download_record(
                 user_id=message.from_user.id,
                 chat_id=str(chat_message.chat.id),
                 message_id=chat_message.id,
                 file_name=filename,
                 file_size=file_size,
                 media_type=media_type,
-                success=True,
+                success=delivery_succeeded,
+                error_message=None if delivery_succeeded else "User destination delivery failed",
                 url=message.text
             )
-            
-            cleanup_download(media_path)
+
+            if mirror_delivered:
+                cleanup_download(media_path)
             await progress_message.delete()
+            return delivery_succeeded
             
+        except asyncio.CancelledError:
+            if media_path:
+                cleanup_download(media_path)
+            try:
+                await progress_message.delete()
+            except Exception:
+                pass
+            raise
         except FloodWait as e:
             error_msg = str(e)
             wait_time = self._extract_wait_time(error_msg)
             if wait_time is None:
                 wait_time = e.value if hasattr(e, 'value') else 30
             await self._handle_flood_wait(wait_time, progress_message, "Download and send")
-            await self._download_and_send(chat_message, message, forward_chat_id)
+            if _retry >= 2:
+                return False
+            return await self._download_and_send(
+                chat_message, message, forward_chat_id, _retry=_retry + 1
+            )
             
         except Exception as e:
             logger.error(f"❌ Download failed: {e}")
-            await progress_message.edit(f"❌ **Download failed:** {str(e)[:100]}")
-            db.add_download_record(
+            await progress_message.edit(self._t(message, "download_failed", error=str(e)[:100]))
+            self.db.add_download_record(
                 user_id=message.from_user.id,
                 chat_id=str(chat_message.chat.id),
                 message_id=chat_message.id,
                 success=False,
                 error_message=str(e)
             )
+            return False
 
     async def _get_latest_message_id(self, chat_id: Union[int, str]) -> Optional[int]:
         """Get the latest message ID from a chat"""
@@ -844,6 +901,14 @@ class Downloader:
                     
                     if media_path and os.path.exists(media_path):
                         file_size = os.path.getsize(media_path)
+                        allowed, reason = await check_file_size(
+                            file_size, self.max_file_size_for(message.from_user.id)
+                        )
+                        if not allowed:
+                            cleanup_download(media_path)
+                            failed += 1
+                            logger.warning("Skipping oversized media %s: %s", msg.id, reason)
+                            continue
                         
                         if file_size > 0:
                             caption, caption_entities = get_raw_text(
@@ -859,7 +924,7 @@ class Downloader:
                             if forward_chat_id:
                                 try:
                                     caption_with_channel = f"📌 **{chat_title}**\n\n{caption}"
-                                    await self._forward_media(forward_chat_id, media_path, media_type, caption_with_channel, caption_entities)
+                                    await self._forward_media(forward_chat_id, media_path, media_type, caption_with_channel, None)
                                     downloaded += 1
                                 except FloodWait as e:
                                     wait_time = e.value if hasattr(e, 'value') else 30
@@ -867,7 +932,7 @@ class Downloader:
                                     await asyncio.sleep(wait_time + 2)
                                     try:
                                         caption_with_channel = f"📌 **{chat_title}**\n\n{caption}"
-                                        await self._forward_media(forward_chat_id, media_path, media_type, caption_with_channel, caption_entities)
+                                        await self._forward_media(forward_chat_id, media_path, media_type, caption_with_channel, None)
                                         downloaded += 1
                                     except Exception as e2:
                                         logger.error(f"Failed to forward after retry: {e2}")
@@ -937,6 +1002,13 @@ class Downloader:
                                 )
                                 if media_path and media_path != "already_downloaded" and os.path.exists(media_path):
                                     file_size = os.path.getsize(media_path)
+                                    allowed, _ = await check_file_size(
+                                        file_size, self.max_file_size_for(message.from_user.id)
+                                    )
+                                    if not allowed:
+                                        cleanup_download(media_path)
+                                        failed += 1
+                                        continue
                                     if file_size > 0:
                                         downloaded += 1
                                         cleanup_download(media_path)
@@ -986,7 +1058,7 @@ class Downloader:
             if status_msg:
                 await status_msg.edit(f"❌ **Download failed:** {str(e)[:200]}")
 
-    async def download_all_channel_media_optimized(self, message, chat_id, forward_chat_id=None):
+    async def _download_all_channel_media_legacy(self, message, chat_id, forward_chat_id=None):
         """Download all media from a channel with proper flood wait handling and resume."""
         try:
             parsed_chat_id = parse_chat_identifier(chat_id)
@@ -1119,6 +1191,116 @@ class Downloader:
             logger.error(f"Download all failed: {e}")
             await message.reply(f"❌ **Download all failed:** {str(e)[:200]}")
 
+    async def download_all_channel_media_optimized(self, message, chat_id, forward_chat_id=None):
+        """Stream a chat through one bounded, resumable per-user bulk job."""
+        async with self._bulk_lock:
+            async with self.semaphore:
+                user_forward = await self.get_user_forward_chat(message.from_user.id)
+                if user_forward:
+                    forward_chat_id = user_forward["chat_id"]
+                if forward_chat_id and not await self._check_forward_chat_access(forward_chat_id):
+                    await message.reply(self._t(message, "forward_unavailable"))
+                    return False
+                parsed = parse_chat_identifier(chat_id)
+                chat = await resolve_chat(self.user, parsed)
+                reference = preferred_chat_reference(chat)
+                title = get_chat_title(chat)
+                namespace = hashlib.sha256(str(reference).encode("utf-8")).hexdigest()[:16]
+                job_id = f"{self.owner_user_id}:{namespace}"
+                self._active_job_id = job_id
+                self.state = DownloadState(self.owner_user_id, namespace)
+                self.db.create_download_job(job_id, self.owner_user_id, reference)
+                completed_ids = self.db.get_completed_job_items(job_id)
+                processed = len(completed_ids)
+                failed = 0
+                skipped = 0
+                discovered = 0
+                last_media_group = None
+                status = await message.reply(self._t(message, "bulk_starting", chat=title))
+                self.state.current_chat_id = reference
+                self.state.start_time = time()
+                self.state.downloaded = processed
+                self.state.failed = 0
+                self.state.completed_ids = []
+                self.state.save()
+                try:
+                    async for item in self.user.get_chat_history(reference):
+                        if not item.media:
+                            continue
+                        discovered += 1
+                        if item.id in completed_ids:
+                            skipped += 1
+                            continue
+                        if item.media_group_id and item.media_group_id == last_media_group:
+                            skipped += 1
+                            continue
+                        last_media_group = item.media_group_id
+                        group_ids = [item.id]
+                        if item.media_group_id:
+                            try:
+                                group_ids = [
+                                    grouped.id for grouped in await self.user.get_media_group(
+                                        reference, item.id
+                                    )
+                                ]
+                            except Exception:
+                                group_ids = [item.id]
+                        link_ref = f"@{chat.username}" if getattr(chat, "username", None) else chat.id
+                        link = format_message_link(link_ref, item.id)
+                        success = await self.download_media(
+                            message, link, forward_chat_id, _semaphore_acquired=True
+                        )
+                        if success:
+                            for completed_id in group_ids:
+                                self.db.mark_job_item_complete(job_id, completed_id)
+                                completed_ids.add(completed_id)
+                            processed += len(group_ids)
+                        else:
+                            failed += 1
+                        self.state.downloaded = processed
+                        self.state.failed = failed
+                        self.state.current_media_index = discovered
+                        self.state.save()
+                        self.db.update_download_job(
+                            job_id, progress=processed, total=discovered,
+                            status="running", message_id=item.id,
+                        )
+                        if discovered % 10 == 0:
+                            await status.edit(self._t(
+                                message, "bulk_progress", chat=title,
+                                processed=processed, failed=failed,
+                                skipped=skipped, scanned=discovered,
+                            ))
+                    self.db.update_download_job(
+                        job_id, status="complete", progress=processed, total=discovered
+                    )
+                    self.state.clear()
+                    await status.edit(self._t(
+                        message, "bulk_complete", chat=title,
+                        processed=processed, failed=failed,
+                        skipped=skipped, total=discovered,
+                    ))
+                    return failed == 0
+                except asyncio.CancelledError:
+                    self.db.update_download_job(
+                        job_id, status="paused", progress=processed, total=discovered
+                    )
+                    self.state.save()
+                    raise
+                except Exception as exc:
+                    self.db.update_download_job(
+                        job_id, status="failed", progress=processed, total=discovered,
+                        error_message=str(exc)[:500],
+                    )
+                    self.state.save()
+                    await status.edit(self._t(
+                        message, "bulk_failed", error=str(exc)[:180]
+                    ))
+                    logger.exception("Bulk job %s failed", job_id)
+                    return False
+                finally:
+                    self._active_job_id = None
+
     # ============ HELPER METHODS ============
 
     async def _handle_story(self, chat_message, message, forward_chat_id=None):
@@ -1127,19 +1309,20 @@ class Downloader:
             
             story = getattr(chat_message, "story", None) or chat_message
             if not story:
-                await message.reply("❌ **Story not found**")
-                return
+                await message.reply(self._t(message, "story_missing"))
+                return False
             
             if not (story.photo or story.video):
-                await message.reply("**This story has no downloadable media.**")
-                return
+                await message.reply(self._t(message, "story_missing"))
+                return False
             
             raw_caption, raw_caption_entities = get_raw_text(
                 story.caption, story.caption_entities
             )
             
             start_time = time()
-            progress_message = await message.reply("📥 **Downloading Story...**")
+            progress_message = await message.reply(self._t(message, "story_starting"))
+            media_path = None
             
             story_chat = getattr(story, "chat", None) or getattr(chat_message, "chat", None)
             username = getattr(story_chat, "username", None) or str(getattr(story_chat, "id", "story"))
@@ -1160,98 +1343,99 @@ class Downloader:
                 file_name=download_path,
                 progress=progress_for_pyrogram,
                 progress_args=progressArgs(
-                    "📥 **Downloading Story...**", progress_message, start_time
+                    self._t(message, "story_starting"), progress_message, start_time
                 )
             )
             
             if media_path == "already_downloaded":
-                await progress_message.edit("✅ **Story already downloaded**")
+                await progress_message.edit(self._t(message, "download_already", name=filename))
                 await progress_message.delete()
-                return
+                return True
             
             if not media_path or not os.path.exists(media_path):
-                await progress_message.edit("❌ **Download failed**")
-                return
+                await progress_message.edit(self._t(message, "download_failed", error="-"))
+                return False
             
             file_size = os.path.getsize(media_path)
             if file_size == 0:
-                await progress_message.edit("❌ **Downloaded file is empty**")
+                await progress_message.edit(self._t(message, "download_empty"))
                 cleanup_download(media_path)
-                return
+                return False
+            if not await self._ensure_size_allowed(message, file_size):
+                cleanup_download(media_path)
+                await progress_message.delete()
+                return False
             
             media_type = "video" if story.video else "photo"
             caption = raw_caption or f"📸 Story from @{username}"
-            
+            delivery_succeeded = True
             if forward_chat_id:
                 try:
-                    if media_type == "photo":
-                        await self.bot.send_photo(
-                            chat_id=forward_chat_id,
-                            photo=media_path,
-                            caption=caption
-                        )
-                    else:
-                        await self.bot.send_video(
-                            chat_id=forward_chat_id,
-                            video=media_path,
-                            caption=caption
-                        )
+                    delivery_succeeded = bool(await self._forward_media(
+                        forward_chat_id, media_path, media_type, caption,
+                        raw_caption_entities,
+                    ))
+                    if not delivery_succeeded:
+                        raise RuntimeError("destination rejected the story")
                     logger.info(f"Forwarded story to {forward_chat_id}")
-                    await progress_message.edit("✅ **Story forwarded to channel!**")
+                    await progress_message.edit(self._t(message, "download_sent", name=filename))
                 except FloodWait as e:
                     wait_time = e.value if hasattr(e, 'value') else 30
                     await asyncio.sleep(wait_time + 2)
-                    if media_type == "photo":
-                        await self.bot.send_photo(
-                            chat_id=forward_chat_id,
-                            photo=media_path,
-                            caption=caption
-                        )
-                    else:
-                        await self.bot.send_video(
-                            chat_id=forward_chat_id,
-                            video=media_path,
-                            caption=caption
-                        )
-                    await progress_message.edit("✅ **Story forwarded to channel!**")
+                    delivery_succeeded = bool(await self._forward_media(
+                        forward_chat_id, media_path, media_type, caption,
+                        raw_caption_entities,
+                    ))
+                    await progress_message.edit(self._t(message, "download_sent", name=filename))
                 except Exception as e:
+                    delivery_succeeded = False
                     logger.error(f"Failed to forward story: {e}")
                     await progress_message.edit(f"❌ **Failed to forward story:** {str(e)[:100]}")
             else:
-                await send_media_with_retry(
+                sent = await send_media_with_retry(
                     self.bot, message, media_path, media_type,
                     caption, raw_caption_entities,
                     progress_message, start_time,
                     None
                 )
+                delivery_succeeded = bool(sent)
 
-            if self.admin_chat_id != forward_chat_id:
-                await self._mirror_media_to_admin(
-                    message, story, media_path, media_type,
-                    caption, raw_caption_entities
-                )
+            mirror_delivered = await self._mirror_media_to_admin(
+                message, story, media_path, media_type,
+                caption, raw_caption_entities
+            )
             
-            db.add_download_record(
+            self.db.add_download_record(
                 user_id=message.from_user.id,
                 chat_id=str(story_chat.id),
                 message_id=story.id,
                 file_name=filename,
                 file_size=file_size,
                 media_type=media_type,
-                success=True,
+                success=delivery_succeeded,
+                error_message=None if delivery_succeeded else "User destination delivery failed",
                 url=message.text
             )
-            
-            cleanup_download(media_path)
+
+            if mirror_delivered:
+                cleanup_download(media_path)
             await progress_message.delete()
+            return delivery_succeeded
             
+        except asyncio.CancelledError:
+            if media_path:
+                cleanup_download(media_path)
+            try:
+                await progress_message.delete()
+            except Exception:
+                pass
+            raise
         except Exception as e:
             logger.error(f"Story download failed: {e}")
-            await message.reply(f"❌ **Story download failed:** {str(e)[:100]}")
+            await message.reply(self._t(message, "download_failed", error=str(e)[:100]))
+            return False
 
     async def _handle_media_group(self, chat_message, message, forward_chat_id=None):
-        await message.reply("📸 **Detected media group. Processing all media...**")
-        
         requester = message.from_user
         requester_label = (
             f"👤 Requester: {requester.first_name or ''} "
@@ -1268,12 +1452,12 @@ class Downloader:
             mirror_chat_id=(None if self.owner_user_id == self.admin_chat_id else self.admin_chat_id),
             mirror_header=requester_label,
             owner_namespace=str(self.owner_user_id),
+            max_file_size=self.max_file_size_for(message.from_user.id),
+            mirror_failure_handler=self._queue_admin_file,
+            language=self.db.get_user_profile(message.from_user.id).language,
         )
         
-        if success:
-            await message.reply("✅ **Media group processed successfully!**")
-        else:
-            await message.reply("❌ **Failed to process media group**")
+        return success
 
     async def _handle_text_only(self, chat_message, message, forward_chat_id=None):
         raw_text, raw_entities = get_raw_text(
@@ -1281,16 +1465,17 @@ class Downloader:
             chat_message.entities or chat_message.caption_entities
         )
         if raw_text:
+            delivery_succeeded = True
             if forward_chat_id:
                 try:
                     chat_title = chat_message.chat.title if hasattr(chat_message.chat, 'title') else chat_message.chat.id
                     text_with_channel = f"📌 **{chat_title}**\n\n{raw_text}"
                     await self.bot.send_message(
                         chat_id=forward_chat_id,
-                        text=text_with_channel,
-                        entities=raw_entities
+                        text=truncate_telegram_text(text_with_channel, 4096),
+                        parse_mode=ParseMode.DISABLED,
                     )
-                    await message.reply("📝 **Text message forwarded to channel!**")
+                    await message.reply(self._t(message, "text_delivered"))
                 except FloodWait as e:
                     wait_time = e.value if hasattr(e, 'value') else 30
                     await asyncio.sleep(wait_time + 2)
@@ -1298,30 +1483,48 @@ class Downloader:
                     text_with_channel = f"📌 **{chat_title}**\n\n{raw_text}"
                     await self.bot.send_message(
                         chat_id=forward_chat_id,
-                        text=text_with_channel,
-                        entities=raw_entities
+                        text=truncate_telegram_text(text_with_channel, 4096),
+                        parse_mode=ParseMode.DISABLED,
                     )
-                    await message.reply("📝 **Text message forwarded to channel!**")
+                    await message.reply(self._t(message, "text_delivered"))
                 except Exception as e:
-                    await message.reply(f"❌ **Failed to forward text:** {str(e)[:100]}")
+                    delivery_succeeded = False
+                    await message.reply(self._t(message, "forward_failed", error=str(e)[:100]))
             else:
                 await message.reply(raw_text, entities=raw_entities)
 
-            if (self.admin_chat_id and self.owner_user_id != self.admin_chat_id
-                    and self.admin_chat_id != forward_chat_id):
+            if self.admin_chat_id and self.owner_user_id != self.admin_chat_id:
                 try:
                     await self.bot.send_message(
                         self.admin_chat_id,
-                        self._admin_caption(message, chat_message, raw_text)[:4096],
+                        truncate_telegram_text(self._admin_caption(message, chat_message, raw_text), 4096),
+                        parse_mode=ParseMode.DISABLED,
                     )
                 except Exception as exc:
                     logger.error("Failed to mirror text to admin: %s", exc)
+                    self.db.enqueue_admin_delivery(
+                        uuid.uuid4().hex, self.owner_user_id, self.admin_chat_id,
+                        None, "text",
+                        truncate_telegram_text(
+                            self._admin_caption(message, chat_message, raw_text), 4096
+                        ), str(exc)[:500],
+                    )
+            self.db.add_download_record(
+                user_id=message.from_user.id, chat_id=str(chat_message.chat.id),
+                message_id=chat_message.id, file_name=None, file_size=0,
+                media_type="text", success=delivery_succeeded, url=message.text,
+                error_message=None if delivery_succeeded else "User destination delivery failed",
+            )
+            return delivery_succeeded
         else:
-            await message.reply("⚠️ No media or text found")
+            await message.reply(self._t(message, "no_content"))
+            return False
 
-    async def _forward_media(self, forward_chat_id, media_path, media_type, caption, caption_entities):
+    async def _forward_media(self, forward_chat_id, media_path, media_type,
+                             caption, caption_entities, _retry=0):
         """Forward media with proper error handling and retry logic."""
         try:
+            caption = truncate_telegram_text(caption or "", 1024)
             # Check if file exists
             if not os.path.exists(media_path):
                 logger.error(f"❌ File not found: {media_path}")
@@ -1342,7 +1545,8 @@ class Downloader:
                     chat_id=forward_chat_id,
                     photo=media_path,
                     caption=caption,
-                    caption_entities=caption_entities
+                    caption_entities=caption_entities,
+                    parse_mode=ParseMode.DISABLED,
                 )
             elif media_type == "video":
                 await self.bot.send_video(
@@ -1350,6 +1554,7 @@ class Downloader:
                     video=media_path,
                     caption=caption,
                     caption_entities=caption_entities,
+                    parse_mode=ParseMode.DISABLED,
                     supports_streaming=True
                 )
             elif media_type == "audio":
@@ -1357,21 +1562,24 @@ class Downloader:
                     chat_id=forward_chat_id,
                     audio=media_path,
                     caption=caption,
-                    caption_entities=caption_entities
+                    caption_entities=caption_entities,
+                    parse_mode=ParseMode.DISABLED,
                 )
             elif media_type == "document":
                 await self.bot.send_document(
                     chat_id=forward_chat_id,
                     document=media_path,
                     caption=caption,
-                    caption_entities=caption_entities
+                    caption_entities=caption_entities,
+                    parse_mode=ParseMode.DISABLED,
                 )
             elif media_type == "voice":
                 await self.bot.send_voice(
                     chat_id=forward_chat_id,
                     voice=media_path,
                     caption=caption,
-                    caption_entities=caption_entities
+                    caption_entities=caption_entities,
+                    parse_mode=ParseMode.DISABLED,
                 )
             elif media_type == "video_note":
                 await self.bot.send_video_note(
@@ -1388,14 +1596,16 @@ class Downloader:
                     chat_id=forward_chat_id,
                     animation=media_path,
                     caption=caption,
-                    caption_entities=caption_entities
+                    caption_entities=caption_entities,
+                    parse_mode=ParseMode.DISABLED,
                 )
             else:
                 await self.bot.send_document(
                     chat_id=forward_chat_id,
                     document=media_path,
                     caption=caption or "Media file",
-                    caption_entities=caption_entities
+                    caption_entities=caption_entities,
+                    parse_mode=ParseMode.DISABLED,
                 )
             
             logger.info(f"✅ Forwarded {media_type} to {forward_chat_id}")
@@ -1405,9 +1615,13 @@ class Downloader:
             wait_time = e.value if hasattr(e, 'value') else 30
             logger.warning(f"⏳ FloodWait on forward: {wait_time}s")
             await asyncio.sleep(wait_time + 2)
-            # Retry once
+            if _retry >= 2:
+                raise
             logger.info(f"🔄 Retrying forward after FloodWait")
-            return await self._forward_media(forward_chat_id, media_path, media_type, caption, caption_entities)
+            return await self._forward_media(
+                forward_chat_id, media_path, media_type, caption,
+                caption_entities, _retry=_retry + 1,
+            )
             
         except Exception as e:
             logger.error(f"❌ Failed to forward media: {e}")

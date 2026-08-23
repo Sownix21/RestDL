@@ -64,6 +64,25 @@ class MultiUserStorageTests(unittest.TestCase):
         self.assertTrue(self.db.delete_telegram_credential(9_000_000_003))
         self.assertIsNone(self.db.get_telegram_credential(9_000_000_003))
 
+    def test_bulk_resume_and_admin_outbox_are_durable(self):
+        user_id = 9_000_000_004
+        job_id = "job:test"
+        self.db.create_download_job(job_id, user_id, "@example")
+        self.db.mark_job_item_complete(job_id, 10)
+        self.db.mark_job_item_complete(job_id, 11)
+        self.assertEqual(self.db.get_completed_job_items(job_id), {10, 11})
+
+        self.db.enqueue_admin_delivery(
+            "delivery:test", user_id, 123, None, "text", "mirror"
+        )
+        pending = self.db.get_pending_admin_deliveries()
+        self.assertEqual([item.id for item in pending], ["delivery:test"])
+        self.db.update_admin_delivery("delivery:test", attempts=1, status="sent")
+        self.assertEqual(self.db.get_pending_admin_deliveries(), [])
+
+        self.db.clear_user_download_state(user_id)
+        self.assertEqual(self.db.get_completed_job_items(job_id), set())
+
 
 if __name__ == "__main__":
     unittest.main()

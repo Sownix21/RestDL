@@ -1,18 +1,24 @@
 [Unit]
-Description=RestrictiveDL Telegram downloader
+Description=DLoader Telegram downloader
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=restdl
-Group=restdl
-WorkingDirectory=/opt/restdl
-EnvironmentFile=/etc/restdl/restdl.env
-ExecStart=/opt/restdl/.venv/bin/python /opt/restdl/main.py
+User=dloader
+Group=dloader
+WorkingDirectory=/opt/dloader
+EnvironmentFile=/etc/dloader/dloader.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/dloader/.venv/bin/python /opt/dloader/main.py
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
+TimeoutStartSec=90
+MemoryMax=2G
+TasksMax=256
+LimitNOFILE=65536
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -23,7 +29,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/lib/restdl /var/log/restdl /opt/restdl/downloads /opt/restdl/logs
+ReadWritePaths=/var/lib/dloader /var/log/dloader
 
 [Install]
 WantedBy=multi-user.target

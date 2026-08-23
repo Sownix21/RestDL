@@ -1,8 +1,13 @@
+import os
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from helpers.chats import resolve_chat
-from helpers.files import get_readable_file_size, sanitize_filename
+from config import Config
+from helpers.files import cleanup_old_downloads, get_readable_file_size, sanitize_filename
 from i18n import TRANSLATIONS, tr
 from helpers.msg import (
     extract_urls,
@@ -48,10 +53,30 @@ class TelegramIdentifierTests(unittest.TestCase):
 
     def test_file_size_formatting_uses_binary_units(self):
         self.assertEqual(get_readable_file_size(1024 * 1024), "1.00 MB")
+        self.assertEqual(get_readable_file_size(1536.0), "1.50 KB")
 
     def test_telegram_filename_cannot_escape_download_directory(self):
         self.assertEqual(sanitize_filename("../../secret.txt"), "secret.txt")
         self.assertEqual(sanitize_filename("bad:name?.mp4"), "bad_name_.mp4")
+
+    def test_cleanup_preserves_pending_admin_delivery_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_download_dir = Config.DOWNLOAD_DIR
+            Config.DOWNLOAD_DIR = directory
+            retained = Path(directory) / "retained.bin"
+            removable = Path(directory) / "removable.bin"
+            retained.write_bytes(b"admin")
+            removable.write_bytes(b"old")
+            old_time = time.time() - 10 * 86400
+            os.utime(retained, (old_time, old_time))
+            os.utime(removable, (old_time, old_time))
+            try:
+                removed, _ = cleanup_old_downloads(7, {retained})
+            finally:
+                Config.DOWNLOAD_DIR = old_download_dir
+            self.assertEqual(removed, 1)
+            self.assertTrue(retained.exists())
+            self.assertFalse(removable.exists())
 
     def test_locales_have_identical_interface_keys(self):
         self.assertEqual(set(TRANSLATIONS["en"]), set(TRANSLATIONS["fa"]))

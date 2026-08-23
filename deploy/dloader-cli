@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SERVICE="restdl.service"
-ENV_FILE="/etc/restdl/restdl.env"
-APP_DIR="/opt/restdl"
-DATA_DIR="/var/lib/restdl"
+SERVICE="dloader.service"
+ENV_FILE="/etc/dloader/dloader.env"
+APP_DIR="/opt/dloader"
+DATA_DIR="/var/lib/dloader"
 
 need_root() {
   if [[ ${EUID} -ne 0 ]]; then exec sudo -- "$0" "$@"; fi
@@ -15,7 +15,7 @@ set_env() {
   tmp="$(mktemp)"
   if [[ -f "$ENV_FILE" ]]; then grep -v "^${key}=" "$ENV_FILE" > "$tmp" || true; fi
   printf '%s=%s\n' "$key" "$value" >> "$tmp"
-  install -m 600 -o root -g restdl "$tmp" "$ENV_FILE"
+  install -m 600 -o root -g dloader "$tmp" "$ENV_FILE"
   rm -f "$tmp"
 }
 
@@ -25,7 +25,7 @@ get_env() {
 
 authorize_admin() {
   local admin="$1" api_id="$2" api_hash="$3" admin_auth authorized_id admin_session
-  if ! admin_auth="$(RESTDL_SETUP_API_ID="$api_id" RESTDL_SETUP_API_HASH="$api_hash" \
+  if ! admin_auth="$(DLOADER_SETUP_API_ID="$api_id" DLOADER_SETUP_API_HASH="$api_hash" \
     "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/generate_session.py" --machine)"; then
     echo "Administrator Telegram authorization failed; configuration was not changed." >&2
     return 1
@@ -68,12 +68,12 @@ configure() {
   read -rsp "Telegram API hash: " api_hash </dev/tty; echo
   read -rsp "Bot token: " token </dev/tty; echo
   read -rp "Main admin Telegram numeric user ID: " admin </dev/tty
-  read -rp "Database URL [sqlite:////var/lib/restdl/downloads.db]: " db </dev/tty
+  read -rp "Database URL [sqlite:////var/lib/dloader/downloads.db]: " db </dev/tty
   [[ "$api_id" =~ ^[0-9]+$ ]] || { echo "API ID must be numeric."; return 1; }
   [[ ${#api_hash} -ge 16 ]] || { echo "API hash is too short."; return 1; }
   [[ "$token" == *:* ]] || { echo "Bot token is malformed."; return 1; }
   [[ "$admin" =~ ^[0-9]+$ ]] || { echo "Admin ID must be numeric."; return 1; }
-  db="${db:-sqlite:////var/lib/restdl/downloads.db}"
+  db="${db:-sqlite:////var/lib/dloader/downloads.db}"
   existing_session="$(grep '^SESSION_STRING=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
   admin_session="$existing_session"
   if [[ -z "$existing_session" ]]; then
@@ -94,14 +94,19 @@ configure() {
   if [[ -z "$key" ]]; then
     key="$($APP_DIR/.venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
   fi
-  install -d -m 750 -o root -g restdl /etc/restdl
-  touch "$ENV_FILE"; chmod 600 "$ENV_FILE"; chown root:restdl "$ENV_FILE"
+  install -d -m 750 -o root -g dloader /etc/dloader
+  touch "$ENV_FILE"; chmod 600 "$ENV_FILE"; chown root:dloader "$ENV_FILE"
   set_env API_ID "$api_id"; set_env API_HASH "$api_hash"; set_env BOT_TOKEN "$token"
   set_env ADMIN_USER_ID "$admin"; set_env DATABASE_URL "$db"
   set_env SESSION_STRING "$admin_session"
-  set_env DATA_DIR /var/lib/restdl
+  set_env DATA_DIR /var/lib/dloader
+  set_env DOWNLOAD_DIR /var/lib/dloader/downloads
+  set_env LOG_DIR /var/log/dloader
   set_env SESSION_ENCRYPTION_KEY "$key"; set_env ENVIRONMENT production
-  set_env MAX_CONCURRENT_DOWNLOADS 4; set_env LOG_LEVEL INFO
+  set_env MAX_CONCURRENT_DOWNLOADS 4; set_env MAX_USER_TASKS 2
+  set_env MAX_ACTIVE_USER_SESSIONS 50; set_env SESSION_IDLE_TIMEOUT 1800
+  set_env AUTH_FLOW_TIMEOUT 600; set_env AUTH_ATTEMPTS_PER_HOUR 8
+  set_env MAX_PENDING_AUTH 25; set_env LOG_LEVEL INFO
   echo "Configuration saved. The encryption key is in $ENV_FILE; back it up securely."
 }
 
@@ -117,64 +122,76 @@ backup() {
     systemctl start "$SERVICE"
     return 1
   fi
+  install -m 600 -o root -g root "$ENV_FILE" "$DATA_DIR/backups/config-$stamp.env"
   systemctl start "$SERVICE"
   echo "Backup: $DATA_DIR/backups/downloads-$stamp.db"
+  echo "Encrypted-session key backup: $DATA_DIR/backups/config-$stamp.env"
 }
 
 repair_permissions() {
   [[ -d "$APP_DIR" ]] || { echo "$APP_DIR does not exist."; return 1; }
-  chown -R root:restdl "$APP_DIR"
+  chown -R root:dloader "$APP_DIR"
   chmod -R go-w "$APP_DIR"
   chmod 755 "$APP_DIR"
   chmod -R g+rX "$APP_DIR"
-  install -d -m 750 -o restdl -g restdl \
-    "$APP_DIR/downloads" "$APP_DIR/logs" "$DATA_DIR" /var/log/restdl
-  chown -R restdl:restdl \
-    "$APP_DIR/downloads" "$APP_DIR/logs" "$DATA_DIR" /var/log/restdl
-  if [[ -d /etc/restdl ]]; then
-    chown root:restdl /etc/restdl
-    chmod 750 /etc/restdl
+  install -d -m 750 -o dloader -g dloader \
+    "$DATA_DIR" "$DATA_DIR/downloads" /var/log/dloader
+  chown dloader:dloader "$DATA_DIR"
+  find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name backups \
+    -exec chown -R dloader:dloader -- {} +
+  chown -R dloader:dloader /var/log/dloader
+  if [[ -d /etc/dloader ]]; then
+    chown root:dloader /etc/dloader
+    chmod 750 /etc/dloader
   fi
   if [[ -f "$ENV_FILE" ]]; then
-    chown root:restdl "$ENV_FILE"
+    chown root:dloader "$ENV_FILE"
     chmod 600 "$ENV_FILE"
   fi
-  echo "RestrictiveDL ownership and traversal permissions repaired."
+  echo "DLoader ownership and traversal permissions repaired."
 }
 
 update_app() {
-  systemctl stop "$SERVICE"
-  git -C "$APP_DIR" pull --ff-only
-  "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
-  install -m 644 "$APP_DIR/deploy/restdl.service" /etc/systemd/system/restdl.service
-  install -m 755 "$APP_DIR/deploy/restdl-cli" /usr/local/bin/restdl
-  repair_permissions
-  systemctl daemon-reload
-  systemctl restart "$SERVICE"
-  echo "RestrictiveDL updated and restarted."
+  local source_dir
+  source_dir="$(mktemp -d /tmp/dloader-update.XXXXXX)"
+  if ! git clone --depth 1 "${DLOADER_REPO:-https://github.com/Sownix21/RestDL.git}" "$source_dir"; then
+    rm -rf -- "$source_dir"
+    return 1
+  fi
+  if ! bash "$source_dir/install.sh"; then
+    rm -rf -- "$source_dir"
+    return 1
+  fi
+  rm -rf -- "$source_dir"
+  echo "DLoader atomically updated and health-checked."
+}
+
+healthcheck() {
+  runuser -u dloader -- "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/healthcheck.py"
 }
 
 uninstall_all() {
-  read -rp "Type DELETE RESTDL to remove the service, application, configuration and data: " answer </dev/tty
-  [[ "$answer" == "DELETE RESTDL" ]] || { echo "Cancelled."; return; }
+  read -rp "Type DELETE DLOADER to remove the service, application, configuration and data: " answer </dev/tty
+  [[ "$answer" == "DELETE DLOADER" ]] || { echo "Cancelled."; return; }
   systemctl disable --now "$SERVICE" 2>/dev/null || true
-  rm -f /etc/systemd/system/restdl.service /usr/local/bin/restdl
+  rm -f /etc/systemd/system/dloader.service /usr/local/bin/dloader
   systemctl daemon-reload
-  rm -rf -- "$APP_DIR" /etc/restdl "$DATA_DIR" /var/log/restdl
-  userdel restdl 2>/dev/null || true
-  echo "RestrictiveDL was fully removed. This cannot be undone."
+  rm -rf -- "$APP_DIR" /etc/dloader "$DATA_DIR" /var/log/dloader
+  userdel dloader 2>/dev/null || true
+  echo "DLoader was fully removed. This cannot be undone."
 }
 
 menu() {
   while true; do
     cat <<'EOF'
 
-RestrictiveDL management
+DLoader management
 1) Status          2) Start           3) Stop
 4) Restart         5) Live logs       6) Recent logs
 7) Configure       8) Change admin    9) Change bot token
 10) Backup DB      11) Update app     12) Generate user session
-13) Repair permissions              14) Full uninstall
+13) Repair permissions              14) Health check
+15) Full uninstall
 0) Exit
 EOF
     read -rp "> " choice </dev/tty
@@ -190,9 +207,10 @@ EOF
       9) read -rsp "New bot token: " v </dev/tty; echo; [[ "$v" == *:* ]] && set_env BOT_TOKEN "$v" && systemctl restart "$SERVICE" || echo "Bot token is malformed." ;;
       10) backup ;;
       11) update_app ;;
-      12) sudo -u restdl "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/generate_session.py" ;;
+      12) sudo -u dloader "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/generate_session.py" ;;
       13) repair_permissions; systemctl restart "$SERVICE" ;;
-      14) uninstall_all; exit ;;
+      14) healthcheck ;;
+      15) uninstall_all; exit ;;
       0) exit ;;
       *) echo "Invalid selection." ;;
     esac
@@ -206,7 +224,8 @@ case "${1:-menu}" in
   configure) configure ;;
   update) update_app ;;
   repair) repair_permissions ;;
+  health) healthcheck ;;
   uninstall) uninstall_all ;;
   menu) menu ;;
-  *) echo "Usage: restdl [menu|start|stop|restart|status|logs|configure|update|repair|uninstall]"; exit 2 ;;
+  *) echo "Usage: dloader [menu|start|stop|restart|status|logs|configure|update|repair|health|uninstall]"; exit 2 ;;
 esac

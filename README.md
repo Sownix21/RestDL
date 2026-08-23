@@ -1,4 +1,4 @@
-# RestrictiveDL
+# DLoader
 
 A multi-user Telegram media downloader with isolated user sessions, English/Persian inline menus, per-user forwarding, and mandatory administrator mirroring.
 
@@ -15,7 +15,7 @@ Official references: [creating an API ID](https://core.telegram.org/api/obtainin
 
 ## One-command Linux installation
 
-Install the latest version directly from [Sownix21/RestDL](https://github.com/Sownix21/RestDL):
+Install the latest version directly from [the project repository](https://github.com/Sownix21/RestDL):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Sownix21/RestDL/main/install.sh | sudo bash
@@ -27,31 +27,32 @@ For a cloned checkout:
 sudo bash install.sh
 ```
 
-The installer supports Debian/Ubuntu, creates a locked-down `restdl` system user, virtual environment, systemd service, persistent data directories, encrypted configuration, and `/usr/local/bin/restdl`.
-It automatically repairs ownership and traversal permissions, verifies access as the `restdl` service account, and refuses to start the service if that verification fails.
+The installer supports Debian/Ubuntu, creates a locked-down `dloader` system user, virtual environment, systemd service, persistent data directories, encrypted configuration, and `/usr/local/bin/dloader`.
+It builds and compiles a staged release before stopping the current service, atomically swaps releases, verifies a live bot heartbeat, and restores the previous release automatically if startup fails. Downloads are stored under `/var/lib/dloader/downloads` and logs under `/var/log/dloader`, so application updates cannot overwrite them.
+When upgrading an installation made under the previous product name, the same command safely copies its configuration and persistent database into DLoader, starts and verifies DLoader, and only then disables the legacy service. The old directories are retained as a rollback backup.
 
 After installation, run this anywhere:
 
 ```bash
-restdl
+dloader
 ```
 
-The management menu provides service status/start/stop/restart, configuration, administrator/token changes, recent/live logs, database backup, update, local session generation, and confirmed full uninstall. The configuration is stored at `/etc/restdl/restdl.env` with mode `0600`.
+The management menu provides service status/start/stop/restart, configuration, administrator/token changes, recent/live logs, health checks, database/config-key backup, atomic update, local session generation, and confirmed full uninstall. The configuration is stored at `/etc/dloader/dloader.env` with mode `0600`.
 
 ### Repairing a `status=200/CHDIR` service error
 
-If a version installed before the permission fix cannot enter `/opt/restdl`, run:
+If a version installed before the permission fix cannot enter `/opt/dloader`, run:
 
 ```bash
-sudo systemctl stop restdl
-sudo chown root:restdl /opt/restdl
-sudo chmod 755 /opt/restdl
-sudo chmod -R g+rX /opt/restdl
-sudo systemctl restart restdl
-sudo systemctl status restdl --no-pager
+sudo systemctl stop dloader
+sudo chown root:dloader /opt/dloader
+sudo chmod 755 /opt/dloader
+sudo chmod -R g+rX /opt/dloader
+sudo systemctl restart dloader
+sudo systemctl status dloader --no-pager
 ```
 
-Current installations also provide `sudo restdl repair` and a **Repair permissions** management-menu action.
+Current installations also provide `sudo dloader repair` and a **Repair permissions** management-menu action.
 
 ## Manual development setup
 
@@ -101,5 +102,5 @@ python -m compileall -q .
 ## Operational notes
 
 - Do not run multiple service instances against SQLite.
-- Back up both the database and `SESSION_ENCRYPTION_KEY`; encrypted sessions cannot be recovered without the key.
+- Back up both the database and `SESSION_ENCRYPTION_KEY`; encrypted sessions cannot be recovered without the key. The `dloader` backup menu saves both for SQLite installations.
 - Use only accounts and content you are authorized to access, and comply with Telegram's API Terms of Service and applicable law.

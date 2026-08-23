@@ -2,9 +2,11 @@
 import os
 import re
 import shutil
+import math
 from pathlib import Path
 from datetime import datetime
 from logger import get_logger
+from config import Config
 
 logger = get_logger(__name__)
 
@@ -22,7 +24,7 @@ def sanitize_filename(filename: str, fallback: str = "download.bin") -> str:
 
 def get_download_path(message_id: int, filename: str) -> str:
     """Get download path for a file"""
-    downloads_dir = Path("downloads")
+    downloads_dir = Path(Config.DOWNLOAD_DIR)
     downloads_dir.mkdir(exist_ok=True)
     
     date_dir = downloads_dir / datetime.now().strftime("%Y-%m-%d")
@@ -43,15 +45,19 @@ async def check_file_size(file_size: int, max_size: int = None) -> tuple:
         return False, f"File too large: {get_readable_file_size(file_size)} (max: {get_readable_file_size(max_size)})"
     return True, "OK"
 
-def get_readable_file_size(size_in_bytes: int) -> str:
+def get_readable_file_size(size_in_bytes: float) -> str:
     """Convert bytes to human readable format"""
     if not size_in_bytes:
         return "0 B"
-    
+    try:
+        size = max(0.0, float(size_in_bytes))
+    except (TypeError, ValueError):
+        return "0 B"
+
     size_name = ("B", "KB", "MB", "GB", "TB", "PB")
-    i = int(min(len(size_name) - 1, (size_in_bytes.bit_length() - 1) // 10))
+    i = int(min(len(size_name) - 1, math.floor(math.log(size, 1024)))) if size >= 1 else 0
     p = 1024 ** i
-    return f"{size_in_bytes / p:.2f} {size_name[i]}"
+    return f"{size / p:.2f} {size_name[i]}"
 
 def get_readable_time(seconds: float) -> str:
     """Convert seconds to human readable time format"""
@@ -78,20 +84,26 @@ def cleanup_download(file_path: str) -> bool:
         logger.error(f"Failed to cleanup {file_path}: {e}")
     return False
 
-def cleanup_old_downloads(days: int = 7) -> tuple:
+def cleanup_old_downloads(days: int = 7, exclude_paths=None) -> tuple:
     """Clean up downloads older than specified days"""
-    downloads_dir = Path("downloads")
+    downloads_dir = Path(Config.DOWNLOAD_DIR)
     if not downloads_dir.exists():
         return 0, 0
     
     files_removed = 0
     bytes_freed = 0
     cutoff = datetime.now().timestamp() - (days * 24 * 60 * 60)
+    excluded = {
+        os.path.normcase(os.path.abspath(str(path)))
+        for path in (exclude_paths or ()) if path
+    }
     
     try:
         for root, dirs, files in os.walk(downloads_dir):
             for file in files:
                 file_path = Path(root) / file
+                if os.path.normcase(os.path.abspath(str(file_path))) in excluded:
+                    continue
                 if file_path.stat().st_mtime < cutoff:
                     bytes_freed += file_path.stat().st_size
                     file_path.unlink()

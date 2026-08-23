@@ -104,6 +104,32 @@ class PhoneLoginLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.username, "tester")
         self.assertNotIn(1002, self.manager._pending_phone)
 
+    def test_authorization_attempts_are_rate_limited(self):
+        with patch.object(session_manager.Config, "AUTH_ATTEMPTS_PER_HOUR", 2):
+            self.manager._register_auth_attempt(1003)
+            self.manager._register_auth_attempt(1003)
+            with self.assertRaises(RuntimeError):
+                self.manager._register_auth_attempt(1003)
+
+    def test_touch_refreshes_active_account(self):
+        account = session_manager.ConnectedAccount(
+            FakeClient(), 77, "tester", "Test User", 0.0
+        )
+        self.manager._accounts[1004] = account
+        self.manager.touch(1004)
+        self.assertGreater(account.last_used, 0.0)
+
+    async def test_capacity_evicts_least_recently_used_client(self):
+        old_client = FakeClient()
+        old_client.is_connected = True
+        self.manager._accounts[1005] = session_manager.ConnectedAccount(
+            old_client, 77, "old", "Old User", 1.0
+        )
+        with patch.object(session_manager.Config, "MAX_ACTIVE_USER_SESSIONS", 1):
+            await self.manager._ensure_capacity(1006)
+        self.assertNotIn(1005, self.manager._accounts)
+        self.assertFalse(old_client.is_connected)
+
 
 if __name__ == "__main__":
     unittest.main()
