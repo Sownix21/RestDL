@@ -157,7 +157,7 @@ class Database:
                 "forward_chat_title": "VARCHAR(255)",
             },
             "admin_deliveries": {
-                "next_attempt_at": "DATETIME",
+                "next_attempt_at": "TIMESTAMP",
             },
         }
         schema = inspect(self.engine)

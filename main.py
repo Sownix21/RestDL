@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 import json
 import io
 import base64
+import hashlib
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -123,7 +124,7 @@ from config import Config
 from logger import get_logger
 from database import Database
 from helpers.downloader import Downloader
-from helpers.forward import check_forward_permission, resolve_forward_chat_id
+from helpers.forward import check_forward_permission, resolve_forward_chat_id, probe_destination
 from helpers.files import (
     get_readable_file_size, get_readable_time,
     cleanup_downloads_root, cleanup_old_downloads
@@ -148,15 +149,17 @@ db = Database()
 
 # ============ INITIALIZE BOT CLIENTS ============
 
+bot_session_dir = os.path.join(Config.DATA_DIR, "bot_sessions")
+os.makedirs(bot_session_dir, mode=0o700, exist_ok=True)
 bot = Client(
-    "dloader_bot",
+    "bot_" + hashlib.sha256(Config.BOT_TOKEN.encode()).hexdigest()[:16],
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN,
-    # Bot authorization is fully represented by BOT_TOKEN. Keeping an MTProto
-    # session on disk can preserve stale update state after deployments or an
-    # unclean shutdown, leaving a connected bot that receives no new messages.
-    in_memory=True,
+    # Numeric private-channel IDs require the bot's own persistent peer hashes.
+    # A token-specific name also prevents reuse after changing bot credentials.
+    workdir=bot_session_dir,
+    in_memory=False,
     workers=4,
     parse_mode=ParseMode.MARKDOWN,
     max_concurrent_transmissions=1,
@@ -178,6 +181,7 @@ download_semaphore = None
 forward_chat_id = None
 downloader = None
 session_manager = UserSessionManager(db)
+session_manager.is_busy = lambda uid: any(not task.done() for task in USER_TASKS.get(uid, ()))
 user_downloaders = {}
 FORWARD_SETUP_COMPLETE = False
 SHUTDOWN_IN_PROGRESS = False
@@ -186,7 +190,17 @@ pid_lock = check_single_instance()
 # ============ TASK MANAGEMENT ============
 
 def track_task(coro, user_id=None):
-    task = asyncio.create_task(coro)
+    async def run():
+        try:
+            return await coro
+        except Exception as exc:
+            if user_id is not None:
+                try:
+                    await bot.send_message(user_id, tr(user_language(user_id), "download_failed", error=str(exc)[:160]))
+                except Exception:
+                    logger.exception("Could not notify user %s of task failure", user_id)
+            raise
+    task = asyncio.create_task(run())
     RUNNING_TASKS.add(task)
     if user_id is not None:
         USER_TASKS.setdefault(user_id, set()).add(task)
@@ -885,8 +899,11 @@ async def handle_ui_callback(callback_query: CallbackQuery):
             await callback_query.message.reply(tr(language, "forward_not_set"))
             return
         destination = parse_chat_identifier(settings.forward_chat_id)
-        probe = await bot.send_message(destination, tr(language, "forward_probe"))
-        await probe.delete()
+        account = await connected_account(user_id)
+        await probe_destination(bot, destination, tr(language, "forward_probe"),
+                                account.client if account else None)
+        if user_id in user_downloaders:
+            user_downloaders[user_id]._forward_chat_cache.clear()
         await callback_query.message.reply(tr(language, "forward_test_ok"))
     elif action == "admin":
         if not is_admin(user_id):
@@ -1049,8 +1066,7 @@ async def handle_conversation_input(_, message: Message):
         elif state.state == "set_forward":
             parsed = parse_chat_identifier(value)
             chat = await bot.get_chat(parsed)
-            test = await bot.send_message(chat.id, tr(language, "forward_probe"))
-            await test.delete()
+            await probe_destination(bot, chat.id, tr(language, "forward_probe"))
             db.update_user_settings(
                 user_id, forward_chat_id=str(chat.id),
                 forward_chat_title=getattr(chat, "title", None) or str(chat.id),
@@ -1069,7 +1085,7 @@ async def handle_conversation_input(_, message: Message):
                 raise ValueError(tr(language, "range_two_required"))
             start_chat, start_id = getChatMsgID(links[0])
             end_chat, end_id = getChatMsgID(links[1])
-            if start_chat != end_chat or start_id > end_id or end_id - start_id > 500:
+            if start_chat != end_chat or start_id > end_id or end_id - start_id >= 500:
                 raise ValueError(tr(language, "range_invalid"))
             instance = await get_user_downloader(user_id)
             if not instance:
@@ -1190,56 +1206,6 @@ async def start_command(_, message: Message):
     else:
         await show_main(message, message.from_user.id, welcome=True)
     return
-    await ensure_forward_chat_setup()
-    
-    welcome_text = (
-        "🚀 **DLoader**\n\n"
-        "I can download media from any Telegram channel, even restricted ones!\n\n"
-        "**📥 Features:**\n"
-        "• Download posts, stories, and media groups\n"
-        "• Batch download multiple posts\n"
-        "• Download entire channels with `/downloadall`\n"
-        "• Download from restricted channels\n"
-        "• Auto-forward to another chat\n"
-        "• Custom forward channel per user\n"
-        "• Download history tracking\n"
-        "• Support for all media types\n\n"
-        "**📚 Commands:**\n"
-        "• `/dl <url>` - Download single post\n"
-        "• `/dls <url>` - Download story\n"
-        "• `/bdl <start> <end>` - Batch download posts\n"
-        "• `/bdls <start> <end>` - Batch download stories\n"
-        "• `/downloadall <chat_id>` - Download ALL media from a channel\n"
-        "• `/stopdownload` - Stop all downloads\n"
-        "• `/list <chat_id>` - List recent messages\n"
-        "• `/latest <chat_id>` - Get latest message\n"
-        "• `/testurl <url>` - Test URL parsing\n"
-        "• `/whoami` - Check current user account\n"
-        "• `/joincheck <chat_id>` - Check channel membership\n"
-        "• `/stats` - View your statistics\n"
-        "• `/settings` - Configure your preferences\n"
-        "• `/cleanup` - Clean temporary files\n"
-        "• `/cleandb` - Clean database and session files\n"
-        "• `/killall` - Cancel all downloads\n"
-        "• `/logs` - Download bot logs\n"
-        "• `/testforwarding` - Test forward chat\n"
-        "• `/help` - Show this help\n\n"
-        "**📤 Forward Channel Commands:**\n"
-        "• `/setforward <chat_id>` - Set custom forward channel\n"
-        "• `/clearforward` - Clear custom forward channel\n"
-        "• `/myforward` - Check your current forward channel\n\n"
-        "**🔑 Requirements:**\n"
-        "• Your account must be a member of the channel\n"
-        "• For private channels, accept the invite first\n\n"
-        "Ready to download! Send me a Telegram link or chat ID."
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Stats", callback_data="stats"),
-         InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
-    ])
-    
-    await message.reply(welcome_text, reply_markup=keyboard, disable_web_page_preview=True)
 
 @bot.on_message(filters.command("help") & filters.private)
 async def help_command(_, message: Message):
@@ -1252,58 +1218,6 @@ async def help_command(_, message: Message):
         ]]), disable_web_page_preview=True,
     )
     return
-    help_text = (
-        "📖 **Help & Commands Guide**\n\n"
-        "**📥 Download Commands:**\n"
-        "• `/dl <post_url>` - Download media from a post\n"
-        "  Example: `/dl https://t.me/channel/123`\n"
-        "  Example: `/dl https://t.me/c/1719871015/123`\n\n"
-        "• `/dls <story_url>` - Download a story\n"
-        "  Example: `/dls https://t.me/username/s/12`\n\n"
-        "• `/bdl <start> <end>` - Batch download posts\n"
-        "  Example: `/bdl https://t.me/channel/100 https://t.me/channel/120`\n\n"
-        "• `/bdls <start> <end>` - Batch download stories\n"
-        "  Example: `/bdls https://t.me/user/s/10 https://t.me/user/s/25`\n\n"
-        "• `/downloadall <chat_id>` - Download ALL media from a channel\n"
-        "  Example: `/downloadall -1001719871015`\n"
-        "  ⚠️ This will download every media in the channel!\n\n"
-        "• `/stopdownload` - Stop all running downloads\n\n"
-        "**📤 Forward Channel Commands:**\n"
-        "• `/setforward <chat_id>` - Set custom forward channel\n"
-        "  Example: `/setforward -100123456789`\n"
-        "• `/clearforward` - Clear custom forward channel\n"
-        "• `/myforward` - Check your current forward channel\n"
-        "• `/testforwarding` - Test if forwarding is working\n\n"
-        "**🔍 Chat ID Commands:**\n"
-        "• `/list <chat_id>` - List recent messages\n"
-        "  Example: `/list -1001719871015`\n"
-        "• `/latest <chat_id>` - Get latest message\n"
-        "  Example: `/latest @channel_name`\n"
-        "• `/testurl <url>` - Test URL parsing\n"
-        "  Example: `/testurl https://t.me/c/1719871015/123`\n"
-        "• `/whoami` - Check current user account\n"
-        "• `/joincheck <chat_id>` - Check channel membership\n\n"
-        "**⚙️ Utility Commands:**\n"
-        "• `/stats` - View your download statistics\n"
-        "• `/settings` - Configure your preferences\n"
-        "• `/cleanup` - Clean temporary files\n"
-        "• `/cleandb` - Clean database and session files\n"
-        "• `/killall` - Cancel all running downloads\n"
-        "• `/logs` - Download bot logs\n"
-        "• `/getid` - Get current chat ID\n\n"
-        "**💡 Tips:**\n"
-        "• Just paste a Telegram link without any command\n"
-        "• You can use chat IDs instead of full URLs\n"
-        "• Media groups are downloaded automatically\n"
-        "• Check /settings to configure your preferences"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Stats", callback_data="stats"),
-         InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
-    ])
-    
-    await message.reply(help_text, reply_markup=keyboard, disable_web_page_preview=True)
 
 # ============ TEST FORWARDING COMMAND ============
 
@@ -1560,41 +1474,6 @@ async def settings_command(_, message: Message):
         [InlineKeyboardButton(tr(language, "btn_back"), callback_data="ui:main")],
     ]))
     return
-    settings = db.get_user_settings(message.from_user.id)
-    global forward_chat_id
-    
-    # Check if user has custom forward
-    custom_forward = "❌ Not set"
-    if settings.forward_chat_id:
-        custom_forward = f"✅ {settings.forward_chat_title or settings.forward_chat_id}"
-    
-    # Check global forward
-    global_forward = "❌ Not configured"
-    if forward_chat_id:
-        global_forward = f"✅ {forward_chat_id}"
-    
-    settings_text = (
-        "⚙️ **Your Settings**\n\n"
-        f"**Auto Download:** {'✅' if settings.auto_download else '❌'}\n"
-        f"**Max File Size:** {get_readable_file_size(settings.max_file_size)}\n"
-        f"**Preferred Quality:** {settings.preferred_quality}\n\n"
-        f"**📤 Forward Channels:**\n"
-        f"• **Custom:** {custom_forward}\n"
-        f"• **Global:** {global_forward}\n\n"
-        "Use the buttons below to modify settings:"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Toggle Auto Download", callback_data="toggle_auto")],
-        [InlineKeyboardButton("Change Max Size", callback_data="change_size")],
-        [InlineKeyboardButton("Change Quality", callback_data="change_quality")],
-        [InlineKeyboardButton("📤 Set Custom Forward", callback_data="set_forward")],
-        [InlineKeyboardButton("🗑️ Clear Custom Forward", callback_data="clear_forward")],
-        [InlineKeyboardButton("🧪 Test Forwarding", callback_data="test_forward")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back")]
-    ])
-    
-    await message.reply(settings_text, reply_markup=keyboard)
 
 @bot.on_callback_query()
 async def handle_callback(bot: Client, callback_query: CallbackQuery):
@@ -1603,107 +1482,17 @@ async def handle_callback(bot: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
 
     if data.startswith("ui:"):
-        await handle_ui_callback(callback_query)
+        try:
+            await handle_ui_callback(callback_query)
+        except Exception as exc:
+            logger.exception("Interactive action failed for user %s", user_id)
+            await callback_query.message.reply(tr(user_language(user_id), "invalid_setup", error=str(exc)[:160]))
         return
     # Retired buttons must not bypass current per-user limits or expose the
     # obsolete English-only interface left in already-sent Telegram messages.
     await callback_query.answer(tr(user_language(user_id), "menu_updated"), show_alert=True)
     await show_main(callback_query.message, user_id)
     return
-    
-    if data == "stats":
-        stats = db.get_stats(user_id)
-        await callback_query.message.reply(
-            "📊 **Your Statistics**\n\n"
-            f"**Total Downloads:** {stats['total']}\n"
-            f"**Successful:** {stats['successful']}\n"
-            f"**Failed:** {stats['failed']}\n"
-            f"**Total Size:** {get_readable_file_size(stats['total_size'])}"
-        )
-    
-    elif data == "settings":
-        await settings_command(bot, callback_query.message)
-    
-    elif data == "toggle_auto":
-        settings = db.get_user_settings(user_id)
-        db.update_user_settings(user_id, auto_download=not settings.auto_download)
-        await callback_query.answer(f"Auto download {'enabled' if not settings.auto_download else 'disabled'}")
-        await settings_command(bot, callback_query.message)
-    
-    elif data == "change_size":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("100 MB", callback_data="size_100")],
-            [InlineKeyboardButton("500 MB", callback_data="size_500")],
-            [InlineKeyboardButton("1 GB", callback_data="size_1000")],
-            [InlineKeyboardButton("2 GB", callback_data="size_2000")],
-            [InlineKeyboardButton("🔙 Back", callback_data="settings")]
-        ])
-        await callback_query.message.reply("Select max file size:", reply_markup=keyboard)
-    
-    elif data.startswith("size_"):
-        size_mb = int(data.split("_")[1])
-        size_bytes = size_mb * 1024 * 1024
-        db.update_user_settings(user_id, max_file_size=size_bytes)
-        await callback_query.answer(f"Max size set to {size_mb} MB")
-        await settings_command(bot, callback_query.message)
-    
-    elif data == "set_forward":
-        await callback_query.message.reply(
-            "📤 **Set Custom Forward Channel**\n\n"
-            "Please send the channel ID or username using the command:\n"
-            "`/setforward <chat_id_or_username>`\n\n"
-            "Examples:\n"
-            "• `/setforward -100123456789`\n"
-            "• `/setforward @my_channel`\n\n"
-            "⚠️ The bot must be a member of the channel!"
-        )
-        await callback_query.answer()
-    
-    elif data == "clear_forward":
-        try:
-            db.update_user_settings(user_id, forward_chat_id=None, forward_chat_title=None)
-            await callback_query.answer("Custom forward channel cleared!")
-            await settings_command(bot, callback_query.message)
-        except Exception as e:
-            await callback_query.answer(f"Error: {str(e)[:50]}")
-    
-    elif data == "test_forward":
-        await callback_query.answer("Testing forward...")
-        # Create a fake message to use with test_forwarding_command
-        class FakeMessage:
-            def __init__(self, user_id):
-                self.from_user = type('obj', (object,), {'id': user_id})()
-                self.chat = type('obj', (object,), {'id': user_id})()
-                self.reply = callback_query.message.reply
-        fake_msg = FakeMessage(user_id)
-        await test_forwarding_command(bot, fake_msg)
-    
-    elif data.startswith("confirm_all_"):
-        chat_id = data.replace("confirm_all_", "")
-        await callback_query.answer("Starting download all...")
-        await callback_query.message.edit("📥 **Starting download all content...**")
-        instance = await get_user_downloader(user_id)
-        if not instance:
-            return await callback_query.message.reply(tr(user_language(user_id), "not_connected"))
-        
-        # Check if user has custom forward
-        settings = db.get_user_settings(user_id)
-        effective_forward = settings.forward_chat_id if settings else None
-        
-        track_task(instance.download_all_channel_media_optimized(
-            callback_query.message, 
-            chat_id, 
-            effective_forward
-        ), user_id)
-    
-    elif data == "cancel_all":
-        await callback_query.answer("Download cancelled")
-        await callback_query.message.edit("❌ **Download cancelled**")
-    
-    elif data == "back":
-        await start_command(bot, callback_query.message)
-    
-    await callback_query.answer()
 
 # ============ DOWNLOAD COMMANDS ============
 

@@ -2,6 +2,8 @@
 
 A multi-user Telegram media downloader with isolated user sessions, English/Persian inline menus, per-user forwarding, and mandatory administrator mirroring.
 
+[راهنمای فارسی](README.fa.md)
+
 ## Security model
 
 - The single administrator is configured only on the Linux server with `ADMIN_USER_ID`; users cannot promote themselves in Telegram.
@@ -10,6 +12,7 @@ A multi-user Telegram media downloader with isolated user sessions, English/Pers
 - User downloads go to that user's configured destination (or their private bot chat). 
 - Login codes must **never** be pasted into a Telegram chat. Telegram officially invalidates login codes sent to another chat. The in-bot phone flow collects each digit through callback buttons instead of a chat message; QR login is the recommended option.
 - Treat a Pyrogram session string like a password. Disconnecting through the bot erases its encrypted server copy.
+- The bot's own Telegram session and peer cache persist under `DATA_DIR/bot_sessions`. These session files contain authentication secrets; protect and back up this directory with the database. Ordinary users' credentials remain encrypted in the application database.
 
 Official references: [creating an API ID](https://core.telegram.org/api/obtaining_api_id), [Telegram authorization and code invalidation](https://core.telegram.org/api/auth), [Telegram QR login](https://core.telegram.org/api/qr-login), and [Pyrofork storage/session strings](https://pyrofork.wulan17.dev/main/topics/storage-engines.html).
 
@@ -56,6 +59,8 @@ Current installations also provide `sudo dloader repair` and a **Repair permissi
 
 ## Manual development setup
 
+Use Python 3.12 (the CI-tested version). For local development, change `.env` paths to `DATA_DIR=database`, `DOWNLOAD_DIR=downloads`, `LOG_DIR=logs`, and `DATABASE_URL=sqlite:///database/downloads.db` before running; the example otherwise uses Linux production paths.
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -100,6 +105,22 @@ python -m compileall -q .
 ```
 
 ## Operational notes
+
+### Forward destination stops working after inactivity
+
+The destination setting is stored in the database without an inactivity expiry. Earlier builds kept the bot's Telegram peer/access-hash cache in memory: restarting lost private-channel routing information even though Settings still displayed the correct channel. The bot now stores its own session on disk and retains that information across restarts. Public channels can also be recovered by username using the connected user's account to discover the username, then resolving it through the bot's own account.
+
+After updating, use **Settings → Test destination**. A successful send is accepted even if Telegram refuses deletion of the temporary probe. For a private channel that the old build already forgot, a new channel update (for example a channel post) may be needed once so Telegram supplies the channel to the bot. Persistent storage prevents losing that recovered cache at the next restart. Confirm the bot still has permission to post if testing fails; a missing permission cannot be repaired by changing local state.
+
+Session-cache eviction now excludes active download jobs. The configured active-session count is a target for idle clients, not a reason to interrupt active transfers.
+
+### Publishing and updating
+
+Commit source and tests, then publish to the repository's `main` branch before using the one-command installer. `.gitignore` and `.dockerignore` exclude local credentials, sessions, databases, logs, downloads, and test environments. Linux scripts are normalized to LF with `.gitattributes`.
+
+Run the test suite above and `bash -n install.sh && bash -n deploy/dloader-cli`. Live Telegram login/downloads and Linux systemd installation require an integration smoke test on the target server. Installer rollback restores the old application, environment file, service definition and management command; database migrations are additive and are not reversed.
+
+Run `sudo dloader health` from any directory to check the service heartbeat. Keep persistent volumes mounted in Docker so both settings and the bot peer cache survive replacement of the container.
 
 - Do not run multiple service instances against SQLite.
 - Back up both the database and `SESSION_ENCRYPTION_KEY`; encrypted sessions cannot be recovered without the key. The `dloader` backup menu saves both for SQLite installations.

@@ -47,6 +47,17 @@ class MultiUserStorageTests(unittest.TestCase):
         self.assertIsNone(self.db.get_conversation_state(first))
         self.assertIsNotNone(self.db.get_conversation_state(second))
 
+    def test_forward_destination_survives_reopening_database(self):
+        self.db.update_user_settings(101, forward_chat_id="-100987", forward_chat_title="Destination")
+        self.db.engine.dispose()
+        reopened = Database()
+        try:
+            settings = reopened.get_user_settings(101)
+            self.assertEqual(settings.forward_chat_id, "-100987")
+            self.assertEqual(settings.forward_chat_title, "Destination")
+        finally:
+            reopened.engine.dispose()
+
     def test_credentials_are_stored_per_user_and_can_be_erased(self):
         box = SecretBox(Fernet.generate_key().decode())
         encrypted_session = box.encrypt("session-secret-value")

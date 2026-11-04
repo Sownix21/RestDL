@@ -111,7 +111,7 @@ configure() {
 }
 
 backup() {
-  install -d -m 750 "$DATA_DIR/backups"
+  install -d -m 700 -o root -g root "$DATA_DIR/backups"
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
   if [[ ! -f "$DATA_DIR/downloads.db" ]]; then
     echo "SQLite database not found. For PostgreSQL, use pg_dump with the configured DATABASE_URL."
@@ -122,7 +122,17 @@ backup() {
     systemctl start "$SERVICE"
     return 1
   fi
-  install -m 600 -o root -g root "$ENV_FILE" "$DATA_DIR/backups/config-$stamp.env"
+  if ! install -m 600 -o root -g root "$ENV_FILE" "$DATA_DIR/backups/config-$stamp.env"; then
+    systemctl start "$SERVICE"
+    return 1
+  fi
+  if [[ -d "$DATA_DIR/bot_sessions" ]]; then
+    if ! tar -C "$DATA_DIR" -czf "$DATA_DIR/backups/bot-sessions-$stamp.tar.gz" bot_sessions; then
+      systemctl start "$SERVICE"
+      return 1
+    fi
+    chmod 600 "$DATA_DIR/backups/bot-sessions-$stamp.tar.gz"
+  fi
   systemctl start "$SERVICE"
   echo "Backup: $DATA_DIR/backups/downloads-$stamp.db"
   echo "Encrypted-session key backup: $DATA_DIR/backups/config-$stamp.env"
@@ -167,7 +177,7 @@ update_app() {
 }
 
 healthcheck() {
-  runuser -u dloader -- "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/healthcheck.py"
+  runuser -u dloader -- env DATA_DIR="$DATA_DIR" "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/healthcheck.py"
 }
 
 uninstall_all() {

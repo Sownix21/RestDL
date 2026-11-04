@@ -37,6 +37,12 @@ rollback() {
       if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
         rm -rf -- "$APP_DIR"
         mv -- "$BACKUP_DIR" "$APP_DIR"
+        if [[ -f "$APP_DIR/.rollback.env" ]]; then
+          install -m 600 -o root -g dloader "$APP_DIR/.rollback.env" "$ENV_FILE"
+          rm -f -- "$APP_DIR/.rollback.env"
+        fi
+        install -m 644 "$APP_DIR/deploy/dloader.service" /etc/systemd/system/dloader.service
+        install -m 755 "$APP_DIR/deploy/dloader-cli" /usr/local/bin/dloader
       else
         echo "No prior release exists; keeping the application so 'dloader configure' can repair first-time settings." >&2
       fi
@@ -100,7 +106,9 @@ systemctl stop dloader.service 2>/dev/null || true
 if [[ -d "$APP_DIR" ]]; then
   BACKUP_DIR="/opt/dloader.previous.$(date +%Y%m%d%H%M%S)"
   mv -- "$APP_DIR" "$BACKUP_DIR"
+  if [[ -f "$ENV_FILE" ]]; then install -m 600 "$ENV_FILE" "$BACKUP_DIR/.rollback.env"; fi
 fi
+SWAPPED=1
 mv -- "$STAGE_DIR" "$APP_DIR"
 STAGE_DIR=""
 SWAPPED=1
@@ -120,11 +128,12 @@ set_config DOWNLOAD_DIR "$DATA_DIR/downloads"
 set_config LOG_DIR "$LOG_DIR"
 /usr/local/bin/dloader repair --no-restart
 systemctl reset-failed dloader.service 2>/dev/null || true
+rm -f -- "$DATA_DIR/health.json"
 systemctl restart dloader.service
 
 healthy=0
 for _ in {1..18}; do
-  if runuser -u dloader -- "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/healthcheck.py" >/dev/null 2>&1; then
+  if runuser -u dloader -- env DATA_DIR="$DATA_DIR" "$APP_DIR/.venv/bin/python" "$APP_DIR/scripts/healthcheck.py" >/dev/null 2>&1; then
     healthy=1
     break
   fi

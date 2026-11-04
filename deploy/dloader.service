@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=dloader
 Group=dloader
+UMask=0077
 WorkingDirectory=/opt/dloader
 EnvironmentFile=/etc/dloader/dloader.env
 Environment=PYTHONDONTWRITEBYTECODE=1

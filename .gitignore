@@ -17,3 +17,9 @@ __pycache__/
 runtime-test*
 .idea/
 .vscode/
+database/bot_sessions/
+database/health.json
+.env.*
+!.env.example
+*.db
+*.db-*

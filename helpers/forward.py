@@ -5,6 +5,34 @@ from helpers.msg import parse_chat_identifier
 
 logger = get_logger(__name__)
 
+
+async def probe_destination(bot, chat_id, text, source_client=None):
+    """Verify sending; deletion is optional and never invalidates success.
+
+    Recover public peers by username using the user's account when the bot has
+    not encountered them yet. Never copy an access hash between accounts.
+    """
+    chat_id = parse_chat_identifier(chat_id)
+    try:
+        probe = await bot.send_message(chat_id, text)
+    except Exception as exc:
+        if exc.__class__.__name__ not in {"PeerIdInvalid", "ChannelInvalid"} or source_client is None:
+            raise
+        from helpers.chats import resolve_chat
+        chat = await resolve_chat(source_client, chat_id)
+        username = getattr(chat, "username", None)
+        if not username:
+            raise
+        recovered = await bot.get_chat("@" + username.lstrip("@"))
+        if recovered.id != chat.id:
+            raise ValueError("Destination username resolves to a different chat")
+        probe = await bot.send_message(recovered.id, text)
+    try:
+        await probe.delete()
+    except Exception:
+        logger.debug("Destination accepts messages but probe deletion was unavailable")
+    return probe
+
 async def check_forward_permission(bot, chat_id):
     """
     Check if bot has permission to forward messages to a chat.

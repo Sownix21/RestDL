@@ -47,6 +47,7 @@ class UserSessionManager:
         self._locks: Dict[int, asyncio.Lock] = {}
         self._qr_created_at = {}
         self._auth_attempts = defaultdict(deque)
+        self.is_busy = lambda user_id: False
 
     def _lock(self, user_id: int) -> asyncio.Lock:
         return self._locks.setdefault(user_id, asyncio.Lock())
@@ -67,7 +68,12 @@ class UserSessionManager:
         ]
         if len(ordinary) < Config.MAX_ACTIVE_USER_SESSIONS:
             return
-        _, victim_id = min(ordinary)
+        candidates = [(used, uid) for used, uid in ordinary
+                      if not self.is_busy(uid) and not self._lock(uid).locked()]
+        # Active downloads take priority over the idle-cache size target.
+        if not candidates:
+            return
+        _, victim_id = min(candidates)
         async with self._lock(victim_id):
             await self._disconnect_unlocked(victim_id)
 
@@ -383,7 +389,7 @@ class UserSessionManager:
 
             ordinary = [
                 (user_id, account) for user_id, account in self._accounts.items()
-                if user_id not in self._external_accounts
+                if user_id not in self._external_accounts and not self.is_busy(user_id)
             ]
             evict = {
                 user_id for user_id, account in ordinary
@@ -398,7 +404,8 @@ class UserSessionManager:
                 evict.update(user_id for _, user_id in remaining[:excess])
             for user_id in evict:
                 async with self._lock(user_id):
-                    await self._disconnect_unlocked(user_id)
+                    if not self.is_busy(user_id):
+                        await self._disconnect_unlocked(user_id)
 
     async def disconnect(self, user_id: int, erase: bool = True):
         async with self._lock(user_id):

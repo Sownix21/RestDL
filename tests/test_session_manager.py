@@ -130,6 +130,16 @@ class PhoneLoginLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(1005, self.manager._accounts)
         self.assertFalse(old_client.is_connected)
 
+    async def test_capacity_does_not_disconnect_active_download(self):
+        client = FakeClient()
+        client.is_connected = True
+        self.manager._accounts[1005] = session_manager.ConnectedAccount(client, 77, "busy", "Busy", 1.0)
+        self.manager.is_busy = lambda uid: uid == 1005
+        with patch.object(session_manager.Config, "MAX_ACTIVE_USER_SESSIONS", 1):
+            await self.manager._ensure_capacity(1006)
+        self.assertIn(1005, self.manager._accounts)
+        self.assertTrue(client.is_connected)
+
 
 if __name__ == "__main__":
     unittest.main()
