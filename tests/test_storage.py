@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
@@ -16,6 +17,16 @@ except ModuleNotFoundError as exc:
 
 
 class MultiUserStorageTests(unittest.TestCase):
+    def test_settings_read_failure_does_not_return_an_empty_destination(self):
+        with patch.object(self.db, "get_session", side_effect=RuntimeError("database unavailable")):
+            with self.assertRaises(RuntimeError):
+                self.db.get_user_settings(101)
+
+    def test_settings_write_failure_does_not_report_success(self):
+        with patch.object(self.db, "get_session", side_effect=RuntimeError("database unavailable")):
+            with self.assertRaises(RuntimeError):
+                self.db.update_user_settings(101, forward_chat_id="-100987")
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.old_data_dir = Config.DATA_DIR

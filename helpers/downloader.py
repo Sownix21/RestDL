@@ -45,6 +45,7 @@ from database import Database
 from config import Config
 from i18n import tr
 from helpers.forward import probe_destination
+from helpers.cancellation import check_cancelled
 
 logger = get_logger(__name__)
 
@@ -405,7 +406,7 @@ class Downloader:
             return None
         except Exception as e:
             logger.error(f"Failed to get user forward chat: {e}")
-            return None
+            raise
 
     async def _check_forward_chat_access(self, forward_chat_id):
         """Check if bot can access the forward chat"""
@@ -452,8 +453,11 @@ class Downloader:
         
         max_attempts = 3
         for attempt in range(max_attempts):
+            check_cancelled()
+            result = None
             try:
                 result = await download_func(*args, **kwargs)
+                check_cancelled()
                 
                 if result and os.path.exists(result):
                     file_size = os.path.getsize(result)
@@ -464,7 +468,11 @@ class Downloader:
                     
                     return result
                 return None
-                
+            except asyncio.CancelledError:
+                partial_path = result or kwargs.get("file_name")
+                if partial_path and os.path.isfile(partial_path):
+                    cleanup_download(partial_path)
+                raise
             except FloodWait as e:
                 error_msg = str(e)
                 wait_time = self._extract_wait_time(error_msg)
@@ -537,6 +545,7 @@ class Downloader:
         """Main download function with forward chat support."""
         slot = _existing_download_slot() if _semaphore_acquired else self.semaphore
         async with slot:
+            check_cancelled()
             try:
                 await self._wait_if_paused()
                 
@@ -837,6 +846,7 @@ class Downloader:
                 self.state.save()
                 try:
                     async for item in self.user.get_chat_history(reference):
+                        check_cancelled()
                         if not item.media:
                             continue
                         discovered += 1
@@ -916,6 +926,8 @@ class Downloader:
     # ============ HELPER METHODS ============
 
     async def _handle_story(self, chat_message, message, forward_chat_id=None):
+        media_path = None
+        progress_message = None
         try:
             await self._wait_if_paused()
             
@@ -1135,6 +1147,7 @@ class Downloader:
     async def _forward_media(self, forward_chat_id, media_path, media_type,
                              caption, caption_entities, _retry=0):
         """Forward media with proper error handling and retry logic."""
+        check_cancelled()
         try:
             caption = truncate_telegram_text(caption or "", 1024)
             # Check if file exists
@@ -1220,6 +1233,7 @@ class Downloader:
                     parse_mode=ParseMode.DISABLED,
                 )
             
+            check_cancelled()
             logger.info(f"✅ Forwarded {media_type} to {forward_chat_id}")
             return True
             

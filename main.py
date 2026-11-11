@@ -124,7 +124,8 @@ from config import Config
 from logger import get_logger
 from database import Database
 from helpers.downloader import Downloader
-from helpers.forward import check_forward_permission, resolve_forward_chat_id, probe_destination
+from helpers.forward import check_forward_permission, resolve_forward_chat_id, probe_destination, resolve_destination
+from helpers.cancellation import check_cancelled
 from helpers.files import (
     get_readable_file_size, get_readable_time,
     cleanup_downloads_root, cleanup_old_downloads
@@ -169,7 +170,7 @@ bot = Client(
 # Initialize user client - will prompt for credentials if no session exists
 user = Client(
     "user_session", api_id=Config.API_ID, api_hash=Config.API_HASH,
-    session_string=Config.SESSION_STRING, workers=2,
+    session_string=Config.SESSION_STRING, workers=2, no_updates=True,
     max_concurrent_transmissions=1, sleep_threshold=30,
 ) if Config.SESSION_STRING else None
 
@@ -190,7 +191,10 @@ pid_lock = check_single_instance()
 # ============ TASK MANAGEMENT ============
 
 def track_task(coro, user_id=None):
+    started = False
     async def run():
+        nonlocal started
+        started = True
         try:
             return await coro
         except Exception as exc:
@@ -205,6 +209,8 @@ def track_task(coro, user_id=None):
     if user_id is not None:
         USER_TASKS.setdefault(user_id, set()).add(task)
     def _remove(completed):
+        if not started:
+            coro.close()
         if not completed.cancelled():
             try:
                 error = completed.exception()
@@ -232,7 +238,11 @@ async def cancel_user_tasks(user_id):
             active.append(task)
     if active:
         await asyncio.gather(*active, return_exceptions=True)
-    USER_TASKS.pop(user_id, None)
+    remaining = USER_TASKS.get(user_id)
+    if remaining is not None:
+        remaining.difference_update(tasks)
+        if not remaining:
+            USER_TASKS.pop(user_id, None)
     return len(active)
 
 
@@ -267,6 +277,22 @@ async def get_user_downloader(user_id):
 async def connected_account(user_id):
     """Return the user's client, including the Linux-managed admin account."""
     return await session_manager.get(user_id)
+
+
+async def save_forward_destination(user_id, value):
+    account = await connected_account(user_id)
+    chat = await resolve_destination(bot, value, account.client if account else None)
+    await probe_destination(bot, chat.id, tr(user_language(user_id), "forward_probe"))
+    saved = db.update_user_settings(
+        user_id, forward_chat_id=str(chat.id),
+        forward_chat_title=getattr(chat, "title", None) or str(chat.id),
+    )
+    if saved is None or saved.forward_chat_id != str(chat.id):
+        raise RuntimeError("Forward destination could not be saved")
+    if user_id in user_downloaders:
+        user_downloaders[user_id]._forward_chat_cache.clear()
+    logger.info("Forward destination saved for user %s: %s", user_id, chat.id)
+    return chat
 
 
 def _state_payload(data):
@@ -397,7 +423,7 @@ async def setup_forward_chat():
         return
     
     if not Config.FORWARD_CHAT_ID:
-        logger.info("ℹ️ No FORWARD_CHAT_ID configured in .env")
+        logger.info("No server-wide FORWARD_CHAT_ID configured; per-user destinations are loaded from the database")
         FORWARD_SETUP_COMPLETE = True
         return
     
@@ -864,6 +890,7 @@ async def handle_ui_callback(callback_query: CallbackQuery):
         await callback_query.message.reply(tr(language, "state_cleared"))
         await show_main(callback_query.message, user_id)
     elif action == "cancel_jobs":
+        db.clear_conversation_state(user_id)
         count = await cancel_user_tasks(user_id)
         await callback_query.message.reply(f"{tr(language, 'cancelled')} ({count})")
     elif action == "stats":
@@ -1064,13 +1091,7 @@ async def handle_conversation_input(_, message: Message):
                 track_task(instance.download_all_channel_media_optimized(message, value, destination), user_id)
             await message.reply(tr(language, "queued"), reply_markup=main_keyboard(language, is_admin(user_id)))
         elif state.state == "set_forward":
-            parsed = parse_chat_identifier(value)
-            chat = await bot.get_chat(parsed)
-            await probe_destination(bot, chat.id, tr(language, "forward_probe"))
-            db.update_user_settings(
-                user_id, forward_chat_id=str(chat.id),
-                forward_chat_title=getattr(chat, "title", None) or str(chat.id),
-            )
+            chat = await save_forward_destination(user_id, value)
             db.clear_conversation_state(user_id)
             await message.reply(
                 tr(language, "forward_verified", destination=getattr(chat, "title", None) or chat.id),
@@ -1096,7 +1117,9 @@ async def handle_conversation_input(_, message: Message):
             prefix = links[0].rsplit("/", 1)[0]
             db.clear_conversation_state(user_id)
             async def run_range():
+                check_cancelled()
                 for message_id in range(start_id, end_id + 1):
+                    check_cancelled()
                     await instance.download_media(message, f"{prefix}/{message_id}", destination)
             track_task(run_range(), user_id)
             await message.reply(tr(language, "queued"), reply_markup=main_keyboard(language, is_admin(user_id)))
@@ -1161,7 +1184,7 @@ async def handle_conversation_input(_, message: Message):
 LEGACY_MENU_COMMANDS = [
     "dl", "dls", "bdl", "bdls", "downloadall", "list", "latest",
     "settings", "setforward", "clearforward", "myforward", "testforwarding",
-    "stats", "stopdownload", "killall", "cleanup", "cleandb", "logs",
+    "stats", "stopdownload", "killall", "cancel", "cleanup", "cleandb", "logs",
     "botstats", "getid", "testurl", "setupforward", "whoami", "joincheck",
 ]
 
@@ -1171,7 +1194,24 @@ async def route_legacy_commands_to_menu(_, message: Message):
     """Keep old links/bookmarks working without exposing a second, stale UI."""
     language = user_language(message.from_user.id)
     command = (message.command[0] if message.command else "").lower()
-    if command in {"dl", "dls", "bdl", "bdls", "downloadall"}:
+    if command in {"stopdownload", "killall", "cancel"}:
+        db.clear_conversation_state(message.from_user.id)
+        count = await cancel_user_tasks(message.from_user.id)
+        await message.reply(f"{tr(language, 'cancelled')} ({count})")
+    elif command in {"setforward", "setupforward"}:
+        value = (message.text or "").split(maxsplit=1)
+        if len(value) == 2:
+            try:
+                chat = await save_forward_destination(message.from_user.id, value[1])
+                db.clear_conversation_state(message.from_user.id)
+                await message.reply(tr(language, "forward_verified", destination=getattr(chat, "title", None) or chat.id))
+            except Exception as exc:
+                logger.exception("Destination setup failed for user %s", message.from_user.id)
+                await message.reply(tr(language, "invalid_setup", error=str(exc)[:160]))
+        else:
+            db.set_conversation_state(message.from_user.id, "set_forward", expires_at=datetime.utcnow() + timedelta(minutes=15))
+            await message.reply(tr(language, "ask_forward"))
+    elif command in {"dl", "dls", "bdl", "bdls", "downloadall"}:
         await message.reply(tr(language, "download_title"), reply_markup=download_keyboard(language))
     elif command in {"list", "latest", "joincheck", "testurl"}:
         await message.reply(tr(language, "browse_title"), reply_markup=browse_keyboard(language))
@@ -1481,6 +1521,12 @@ async def handle_callback(bot: Client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
 
+    if data in {"cancel_all", "stopdownload", "cancel_jobs"}:
+        await callback_query.answer()
+        db.clear_conversation_state(user_id)
+        count = await cancel_user_tasks(user_id)
+        await callback_query.message.reply(f"{tr(user_language(user_id), 'cancelled')} ({count})")
+        return
     if data.startswith("ui:"):
         try:
             await handle_ui_callback(callback_query)

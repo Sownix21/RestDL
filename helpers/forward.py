@@ -6,6 +6,24 @@ from helpers.msg import parse_chat_identifier
 logger = get_logger(__name__)
 
 
+async def resolve_destination(bot, identifier, source_client=None):
+    identifier = parse_chat_identifier(identifier)
+    try:
+        return await bot.get_chat(identifier)
+    except Exception as exc:
+        if exc.__class__.__name__ not in {"PeerIdInvalid", "ChannelInvalid"} or source_client is None:
+            raise
+        from helpers.chats import resolve_chat
+        source = await resolve_chat(source_client, identifier)
+        username = getattr(source, "username", None)
+        if not username:
+            raise
+        chat = await bot.get_chat("@" + username.lstrip("@"))
+        if chat.id != source.id:
+            raise ValueError("Destination username resolves to a different chat")
+        return chat
+
+
 async def probe_destination(bot, chat_id, text, source_client=None):
     """Verify sending; deletion is optional and never invalidates success.
 
@@ -31,6 +49,10 @@ async def probe_destination(bot, chat_id, text, source_client=None):
         await probe.delete()
     except Exception:
         logger.debug("Destination accepts messages but probe deletion was unavailable")
+    # Persist the bot's own peer hashes before reporting setup success.
+    storage = getattr(bot, "storage", None)
+    if storage is not None:
+        await storage.save()
     return probe
 
 async def check_forward_permission(bot, chat_id):

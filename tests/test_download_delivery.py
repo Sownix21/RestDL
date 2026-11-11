@@ -1,7 +1,9 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 try:
     from config import Config
@@ -14,6 +16,31 @@ except ModuleNotFoundError as exc:
 
 
 class AlbumDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_download_does_not_retry_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial.bin"
+            path.write_bytes(b"partial")
+            started = asyncio.Event()
+            calls = []
+            async def sdk_download(**kwargs):
+                calls.append(True)
+                started.set()
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    return str(path)
+            instance = Downloader.__new__(Downloader)
+            instance._wait_if_paused = AsyncMock()
+            task = asyncio.create_task(instance._download_safe(
+                sdk_download, None, "test", 1, -100123, file_name=str(path)
+            ))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(path.exists())
+
     async def test_failed_destination_does_not_complete_album(self):
         temporary = tempfile.TemporaryDirectory()
         old_download_dir = Config.DOWNLOAD_DIR

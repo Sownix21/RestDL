@@ -12,6 +12,7 @@ from helpers.files import (
 )
 from i18n import tr
 from config import Config
+from helpers.cancellation import check_cancelled
 
 logger = get_logger(__name__)
 _PROGRESS_UPDATES = {}
@@ -42,6 +43,7 @@ async def progress_for_pyrogram(current: int, total: int, text: str, message: An
         message: Pyrogram message object to update
         start_time: Download start time
     """
+    check_cancelled()
     try:
         now = time()
         diff = now - start_time
@@ -160,6 +162,7 @@ async def process_media_group(
         failed_count = 0
         
         for idx, msg in enumerate(media_group, 1):
+            check_cancelled()
             try:
                 item_delivered = False
                 # Generate filename based on media type
@@ -211,6 +214,7 @@ async def process_media_group(
                 # Download the media
                 logger.info(f"Downloading {idx}/{total_items}: {file_name}")
                 media_path = await msg.download(file_name=download_path)
+                check_cancelled()
                 
                 if media_path and os.path.exists(media_path):
                     file_size = os.path.getsize(media_path)
@@ -347,6 +351,7 @@ async def process_media_group(
                         # it reaches the requesting user's chosen destination.
                         failed_count += 1
 
+                    check_cancelled()
                     retain_file = False
                     if mirror_chat_id and bot:
                         try:
@@ -543,12 +548,14 @@ async def send_media_with_retry(
         Sent message object or None if failed
     """
     for attempt in range(max_retries):
+        check_cancelled()
         try:
             # Send the media
             sent = await send_media(
                 bot, message, media_path, media_type,
                 caption, entities, progress_message, start_time
             )
+            check_cancelled()
             
             # Forward to another chat if enabled
             if forward_chat_id and sent:

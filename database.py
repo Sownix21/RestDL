@@ -233,7 +233,7 @@ class Database:
             return settings
         except Exception as e:
             logger.error(f"Failed to get user settings: {e}")
-            return UserSettings(user_id=user_id)
+            raise
         finally:
             if session:
                 session.close()
@@ -387,7 +387,7 @@ class Database:
             if session:
                 session.rollback()
             logger.error(f"Failed to update user settings: {e}")
-            return None
+            raise
         finally:
             if session:
                 session.close()

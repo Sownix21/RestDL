@@ -5,7 +5,7 @@ from pyrogram.storage.file_storage import FileStorage
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from helpers.forward import probe_destination
+from helpers.forward import probe_destination, resolve_destination
 
 
 class PeerIdInvalid(Exception):
@@ -13,6 +13,20 @@ class PeerIdInvalid(Exception):
 
 
 class ForwardRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_probe_flushes_peer_cache_before_success(self):
+        probe = SimpleNamespace(delete=AsyncMock())
+        storage = SimpleNamespace(save=AsyncMock())
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=probe), storage=storage)
+        await probe_destination(bot, -100123, "test")
+        storage.save.assert_awaited_once()
+
+    async def test_setup_recovers_unknown_public_destination(self):
+        chat = SimpleNamespace(id=-100123, username="destination")
+        bot = SimpleNamespace(get_chat=AsyncMock(side_effect=[PeerIdInvalid(), chat]))
+        source = SimpleNamespace(get_chat=AsyncMock(return_value=chat))
+        self.assertIs(await resolve_destination(bot, "-100123", source), chat)
+        self.assertEqual(bot.get_chat.await_args.args, ("@destination",))
+
     async def test_private_channel_peer_survives_session_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             store = FileStorage("bot_test", Path(directory))

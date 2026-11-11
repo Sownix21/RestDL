@@ -108,6 +108,10 @@ python -m compileall -q .
 
 ### Forward destination stops working after inactivity
 
+`/setforward <channel ID or @username>` saves a destination directly; `/setforward` starts the interactive prompt. Both routes verify sending and flush the bot peer cache before confirming the database write. Database read/write failures are reported, rather than appearing as an empty destination or a successful save. The startup message about an unset server-wide `FORWARD_CHAT_ID` does not describe per-user destinations.
+
+Use `/stopdownload`, `/killall`, `/cancel`, or **Tools → Cancel jobs** to stop your jobs. These commands now cancel directly instead of opening a menu. A message Telegram has already accepted cannot be recalled by cancellation; pending administrator mirror retries for earlier deliveries remain separate from new download jobs.
+
 The destination setting is stored in the database without an inactivity expiry. Earlier builds kept the bot's Telegram peer/access-hash cache in memory: restarting lost private-channel routing information even though Settings still displayed the correct channel. The bot now stores its own session on disk and retains that information across restarts. Public channels can also be recovered by username using the connected user's account to discover the username, then resolving it through the bot's own account.
 
 After updating, use **Settings → Test destination**. A successful send is accepted even if Telegram refuses deletion of the temporary probe. For a private channel that the old build already forgot, a new channel update (for example a channel post) may be needed once so Telegram supplies the channel to the bot. Persistent storage prevents losing that recovered cache at the next restart. Confirm the bot still has permission to post if testing fails; a missing permission cannot be repaired by changing local state.
